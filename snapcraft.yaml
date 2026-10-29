@@ -1,0 +1,26 @@
+name: mle-editor
+summary: Flexible terminal-based editor.
+description: |
+  mle is a small, flexible, terminal-based text editor written in C. 
+  Notable features include: full Unicode support, syntax highlighting, 
+  scriptable rc file, macros, search and replace (PCRE), window 
+  splitting, multiple cursors, and integration with various shell 
+  commands.
+version: 1.8.1
+license: Apache-2.0
+base: core24
+grade: stable
+confinement: strict
+
+apps:
+  mle:
+    command: usr/local/bin/mle
+
+parts:
+  mle:
+    plugin: make
+    source: https://github.com/adsr/mle.git
+    source-commit: 623d6da427a3037181051a8ac94142fa7ae464b5
+    source-type: git
+    make-parameters: ["-j1", "mle_vendor=1", "mle_static=1"]
+    stage-packages: [fzf, tree, less, perl, universal-ctags]
