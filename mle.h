@@ -135,6 +135,7 @@ struct editor_s {
     int debug_display_keys;
     char display_keys_buf[MLE_DISPLAY_KEYS_NKEYS * MLE_MAX_KEYNAME_LEN];
     int exit_code;
+    struct iterm_panel_s *iterm;
 };
 
 // srule_def_t
@@ -439,6 +440,25 @@ int editor_debug_dump(editor_t *editor, FILE *fp);
 int editor_force_redraw(editor_t *editor);
 int editor_set_input_mode(editor_t *editor);
 int editor_input_to_key(kinput_t *input, char *keyname);
+int editor_relayout(editor_t *editor);
+
+// Integrated terminal. The panel is created on first use.
+struct iterm_panel_s;
+int iterm_running(editor_t *editor);
+void iterm_apply_layout(editor_t *editor, bview_rect_t *edit);
+void iterm_draw(editor_t *editor);
+int iterm_handle_key(editor_t *editor, struct tb_event *ev);
+int iterm_handle_mouse(editor_t *editor, struct tb_event *ev);
+void iterm_drain_pending(editor_t *editor);
+int iterm_pty_fds(editor_t *editor, int *fds, int cap);
+void iterm_drain_fd(editor_t *editor, int fd);
+void iterm_shutdown(editor_t *editor);
+int iterm_action(editor_t *editor, const char *action);
+int cmd_iterm(cmd_context_t *ctx);
+int iterm_debug_feed(const char *bytes, int len, int cols, int rows, char *out, int out_cap);
+int iterm_debug_cell(const char *bytes, int len, int cols, int rows, int x, int y, uint32_t *ch, int *fg, int *bg, int *attr);
+int iterm_debug_resize(const char *bytes, int len, int cols, int rows, int cols2, int rows2, char *out, int out_cap);
+int iterm_debug_pty(char *out, int out_cap);
 
 // bview functions
 bview_t *bview_get_split_root(bview_t *self);
