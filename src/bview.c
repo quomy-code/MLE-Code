@@ -154,6 +154,13 @@ int bview_resize(bview_t *self, int x, int y, int w, int h) {
     return MLE_OK;
 }
 
+int bview_sync_linenums(bview_t *self) {
+    if (!self) return MLE_OK;
+    if (_bview_set_linenum_width(self)) bview_resize(self, self->x, self->y, self->w, self->h);
+    if (self->split_child) bview_sync_linenums(self->split_child);
+    return MLE_OK;
+}
+
 // Return top-most split_parent of a bview
 bview_t *bview_get_split_root(bview_t *self) {
     bview_t *root;
@@ -182,23 +189,27 @@ int bview_draw_cursor(bview_t *self, int set_real_cursor) {
     int screen_x;
     int screen_y;
     struct tb_cell *cell;
+    int placed;
+    placed = 0;
     DL_FOREACH(self->cursors, cursor) {
         mark = cursor->mark;
         if (bview_get_screen_coords(self, mark, &screen_x, &screen_y, &cell) != MLE_OK) {
-            // Out of bounds
+            // Out of bounds. Do not leave the previous frame's cursor here.
             continue;
         }
         if (set_real_cursor && cursor == self->active_cursor) {
-            // Set terminal cursor
             tb_set_cursor(screen_x, screen_y);
+            placed = 1;
         } else {
-            // Set fake cursor
-            tb_set_cell(screen_x, screen_y, cell->ch, cell->fg, cell->bg | (cursor->is_asleep ? TB_RED : TB_CYAN)); // TODO configurable
+            mle_theme_t *th = theme_current(self->editor);
+            uintattr_t markc = cursor->is_asleep ? th->err_bg : th->sel_bg;
+            tb_set_cell(screen_x, screen_y, cell->ch, cell->fg, cell->bg | markc);
         }
         if (self->editor->highlight_bracket_pairs) {
             _bview_highlight_bracket_pair(self, mark);
         }
     }
+    if (set_real_cursor && !placed) tb_set_cursor(-1, -1);
     return MLE_OK;
 }
 
@@ -475,6 +486,7 @@ static void _bview_init(bview_t *self, buffer_t *buffer) {
         bview_push_kmap(self, self->editor->kmap_normal);
     }
     bview_push_kmap(self, kmap_init);
+    if (self->editor->kmap_basic) bview_push_kmap(self, self->editor->kmap_basic);
 
     // Set syntax
     bview_set_syntax(self, NULL);
@@ -560,6 +572,12 @@ static int _bview_set_linenum_width(bview_t *self) {
         );
     } else {
         self->rel_linenum_width = 0;
+    }
+    if (self->editor->linenum_type == MLE_LINENUM_TYPE_NONE) {
+        self->abs_linenum_width = 0;
+        self->rel_linenum_width = 0;
+        self->linenum_width = 0;
+        return orig == self->linenum_width ? 0 : 1;
     }
     if (self->editor->linenum_type == MLE_LINENUM_TYPE_ABS) {
         self->linenum_width = self->abs_linenum_width;
@@ -654,13 +672,16 @@ int bview_set_syntax(bview_t *self, char *opt_syntax) {
         // Set by override at init
         HASH_FIND_STR(self->editor->syntax_map, self->editor->syntax_override, use_syntax);
     } else if (self->buffer->path) {
-        // Set by path
+        // Set by path. syntax_last is the newest rule, so specific languages
+        // registered after syn_text win, and syn_text catches everything else.
         for (syntax = self->editor->syntax_last; syntax != NULL; syntax = syntax->hh.prev) {
             if (util_pcre_match(syntax->path_pattern, self->buffer->path, strlen(self->buffer->path), NULL, NULL)) {
                 use_syntax = syntax;
                 break;
             }
         }
+    } else {
+        HASH_FIND_STR(self->editor->syntax_map, "syn_text", use_syntax);
     }
 
     buffer_set_styles_enabled(self->buffer, 0);
@@ -814,140 +835,180 @@ static void _bview_draw_status(bview_t *self) {
     editor = self->editor;
     active = editor->active;
     active_edit = editor->active_edit;
-    mark = active_edit->active_cursor->mark;
 
     // Prompt
     if (active == editor->prompt) {
-        tb_printf_rect(editor->rect_status, 0, 0, TB_GREEN | TB_BOLD, TB_BLACK, "%-*.*s", editor->rect_status.w, editor->rect_status.w, self->editor->prompt->prompt_str);
+        mle_theme_t *th = theme_current(editor);
+        int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+        tb_printf_rect(editor->rect_status, 0, 0, classic ? (TB_GREEN | TB_BOLD) : th->accent_fg, classic ? TB_BLACK : th->accent_bg, "%-*.*s", editor->rect_status.w, editor->rect_status.w, self->editor->prompt->prompt_str);
         goto _bview_draw_status_end;
     }
-
-    // Macro indicator
-    int i_macro_fg, i_macro_bg;
-    char *i_macro;
-    if (editor->is_recording_macro) {
-        i_macro_fg = TB_RED | TB_BOLD;
-        i_macro_bg = TB_BLACK;
-        i_macro = "r";
-    } else if (editor->macro_apply) {
-        i_macro_fg = TB_GREEN | TB_BOLD;
-        i_macro_bg = TB_BLACK;
-        i_macro = "p";
-    } else {
-        i_macro_fg = 0;
-        i_macro_bg = 0;
-        i_macro = ".";
+    if (active_edit && active_edit->is_menu && editor->active_edit_last) active_edit = editor->active_edit_last;
+    if (!active_edit || !active_edit->buffer || !active_edit->active_cursor) {
+        mle_theme_t *th = theme_current(editor);
+        int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+        tb_printf_rect(editor->rect_status, 0, 0, classic ? TB_WHITE : th->muted_fg, classic ? TB_BLACK : th->muted_bg, "%*.*s", editor->rect_status.w, editor->rect_status.w, " ");
+        goto _bview_draw_status_end;
     }
+    mark = active_edit->active_cursor->mark;
 
-    // Anchor indicator
-    int i_anchor_fg, i_anchor_bg;
-    bint_t anchor_len, anchor_nlines;
-    char *i_anchor;
+    bint_t anchor_len;
+    bint_t anchor_nlines;
     cursor_t *cursor;
-    if (active_edit->active_cursor->is_anchored) {
-        i_anchor_fg = TB_WHITE | TB_BOLD;
-        i_anchor_bg = TB_BLACK;
-        i_anchor = "a";
-        cursor = active_edit->active_cursor;
+    bview_t *bview_tmp;
+    int bview_count;
+    int bview_num;
+    int x;
+    int n;
+    char chunk[160];
+    char git[80];
+    const char *fname;
+    const char *base;
+    mle_theme_t *th;
+    int classic;
+
+    th = theme_current(editor);
+    classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+    cursor = active_edit->active_cursor;
+    anchor_len = 0;
+    anchor_nlines = 0;
+    if (cursor && cursor->is_anchored) {
         mark_get_nchars_between(cursor->anchor, cursor->mark, &anchor_len);
-        if (mark_is_gt(cursor->anchor, cursor->mark)) anchor_len *= -1;
+        if (anchor_len < 0) anchor_len *= -1;
         anchor_nlines = cursor->anchor->bline->line_index - cursor->mark->bline->line_index;
         if (anchor_nlines < 0) anchor_nlines *= -1;
-        anchor_nlines += 1;
-    } else {
-        i_anchor_fg = 0;
-        i_anchor_bg = 0;
-        i_anchor = ".";
-        anchor_len = 0;
-        anchor_nlines = 0;
+        if (anchor_len > 0) anchor_nlines += 1;
     }
 
-    // Block indicator
-    int i_block_fg, i_block_bg;
-    char *i_block;
-    if (active_edit->active_cursor->is_block) {
-        i_block_fg = TB_WHITE | TB_BOLD;
-        i_block_bg = TB_BLACK;
-        i_block = "b";
-    } else {
-        i_block_fg = 0;
-        i_block_bg = 0;
-        i_block = ".";
-    }
-
-    // Async indicator
-    int i_async_fg, i_async_bg;
-    char *i_async;
-    if (editor->aprocs) {
-        i_async_fg = TB_YELLOW | TB_BOLD;
-        i_async_bg = TB_BLACK;
-        i_async = "x";
-    } else {
-        i_async_fg = 0;
-        i_async_bg = 0;
-        i_async = ".";
-    }
-
-    // Need-more-input icon
-    int i_needinput_fg;
-    int i_needinput_bg;
-    char *i_needinput;
-    if (editor->loop_ctx->need_more_input) {
-        i_needinput_fg = TB_BLUE | TB_BOLD;
-        i_needinput_bg = TB_BLACK;
-        i_needinput = "n";
-    } else {
-        i_needinput_fg = 0;
-        i_needinput_bg = 0;
-        i_needinput = ".";
-    }
-
-    // Bview num TODO pre-compute this
-    bview_t *bview_tmp;
-    int bview_count = 0;
-    int bview_num = 0;
+    bview_count = 0;
+    bview_num = 0;
     CDL_FOREACH2(editor->all_bviews, bview_tmp, all_next) {
-        if (!MLE_BVIEW_IS_EDIT(bview_tmp)) continue;
+        if (!MLE_BVIEW_IS_EDIT(bview_tmp) || bview_tmp->is_menu) continue;
         bview_count += 1;
         if (bview_tmp == active_edit) bview_num = bview_count;
     }
 
-    // Render status line
     MLBUF_BLINE_ENSURE_CHARS(mark->bline);
-    tb_printf_rect(editor->rect_status, 0, 0, 0, 0, "%*.*s", editor->rect_status.w, editor->rect_status.w, " ");
-    tb_printf_attr(editor->rect_status, 0, 0,
-        "@%d,%d;%s@%d,%d;"                                         // mle_normal    mode
-        "[@%d,%d;%s@%d,%d;%s@%d,%d;%s@%d,%d;%s@%d,%d;%s@%d,%d;]  " // [.....]       need_input,anchor,block,macro,async
-        "buf:@%d,%d;%d@%d,%d;/@%d,%d;%d@%d,%d;  "                  // buf:1/2       bview num
-        "<@%d,%d;%s@%d,%d;>  "                                     // <php>         syntax
-        "line:@%d,%d;%llu@%d,%d;/@%d,%d;%llu@%d,%d;  "             // line:1/100    line
-        "col:@%d,%d;%llu@%d,%d;/@%d,%d;%llu@%d,%d;  "              // col:0/80      col
-        "%s@%d,%d;%lld@%d,%d;,@%d,%d;%llu@%d,%d;  ",               // sel:10,1      sel len, nlines
-        TB_MAGENTA | TB_BOLD, 0, active->kmap_tail->kmap->name, 0, 0,
-        i_needinput_fg, i_needinput_bg, i_needinput,
-        i_anchor_fg, i_anchor_bg, i_anchor,
-        i_block_fg, i_block_bg, i_block,
-        i_macro_fg, i_macro_bg, i_macro,
-        i_async_fg, i_async_bg, i_async, 0, 0,
-        TB_BLUE | TB_BOLD, 0, bview_num, 0, 0, TB_BLUE, 0, bview_count, 0, 0,
-        TB_CYAN | TB_BOLD, 0, active_edit->syntax ? active_edit->syntax->name : "none", 0, 0,
-        TB_YELLOW | TB_BOLD, 0, mark->bline->line_index + 1, 0, 0, TB_YELLOW, 0, active_edit->buffer->line_count, 0, 0,
-        TB_YELLOW | TB_BOLD, 0, mark->col, 0, 0, TB_YELLOW, 0, mark->bline->char_count, 0, 0,
-        anchor_nlines == 0 ? "" : "sel:",
-        anchor_nlines == 0 ? TB_BLACK : TB_YELLOW | TB_BOLD, 0, anchor_len,
-        anchor_nlines == 0 ? TB_BLACK : 0, 0,
-        anchor_nlines == 0 ? TB_BLACK : TB_YELLOW, 0, anchor_nlines, 0, 0
-    );
+    tb_printf_rect(editor->rect_status, 0, 0, classic ? TB_WHITE : th->muted_fg, classic ? TB_BLACK : th->muted_bg, "%*.*s", editor->rect_status.w, editor->rect_status.w, " ");
+    editor->status_file_x = 0;
+    editor->status_file_w = 0;
+    editor->status_pos_x = 0;
+    editor->status_pos_w = 0;
+    editor->status_git_x = 0;
+    editor->status_git_w = 0;
+    x = 0;
+
+    fname = active_edit->buffer->path;
+    base = fname ? strrchr(fname, '/') : NULL;
+    base = (base && base[1]) ? base + 1 : (fname ? fname : "<unsaved>");
+    {
+        int room = editor->rect_status.w;
+        int keep;
+        if (room > (int)sizeof(chunk) - 1) room = (int)sizeof(chunk) - 1;
+        if (room < 1) room = 1;
+        keep = room > 4 ? room - 4 : 0;
+        n = snprintf(chunk, sizeof(chunk), " %.*s%s ", keep, base, active_edit->buffer->is_unsaved ? "*" : "");
+    }
+    if (n < 0) n = 0;
+    if (n >= (int)sizeof(chunk)) n = (int)sizeof(chunk) - 1;
+    if (n > editor->rect_status.w) n = editor->rect_status.w;
+    tb_print(x, editor->rect_status.y, th->file_fg, th->file_bg, chunk);
+    editor->status_file_x = x;
+    editor->status_file_w = n;
+    x += n;
+
+    n = snprintf(chunk, sizeof(chunk), " %d/%d ", bview_num, bview_count);
+    if (n > 0 && x + n < editor->rect_status.w) {
+        tb_print(x, editor->rect_status.y, classic ? (TB_BLACK | TB_BOLD) : th->accent_fg, classic ? TB_BLUE : th->accent_bg, chunk);
+        x += n;
+    }
+
+    n = snprintf(chunk, sizeof(chunk), " Ln %llu/%llu  Col %llu ",
+        (unsigned long long)(mark->bline->line_index + 1),
+        (unsigned long long)active_edit->buffer->line_count,
+        (unsigned long long)mark->col);
+    if (n > 0 && x + n < editor->rect_status.w) {
+        tb_print(x, editor->rect_status.y, th->pos_fg, th->pos_bg, chunk);
+        editor->status_pos_x = x;
+        editor->status_pos_w = n;
+        x += n;
+    }
+
+    if (anchor_len > 0) {
+        n = snprintf(chunk, sizeof(chunk), " Sel %lld ", (long long)anchor_len);
+        if (n > 0 && x + n < editor->rect_status.w) {
+            tb_print(x, editor->rect_status.y, th->accent_fg, th->accent_bg, chunk);
+            x += n;
+        }
+    }
+
+    n = snprintf(chunk, sizeof(chunk), " %s ", active_edit->syntax ? active_edit->syntax->name : "text");
+    if (n > 0 && x + n < editor->rect_status.w) {
+        tb_print(x, editor->rect_status.y, classic ? TB_BLACK : th->bar_fg, classic ? TB_WHITE : th->bar_bg, chunk);
+        x += n;
+    }
+
+    git[0] = '\0';
+    side_git_label(editor, git, sizeof(git));
+    if (git[0]) {
+        const char *sp;
+        int cols;
+        n = snprintf(chunk, sizeof(chunk), " %s ", git);
+        cols = 0;
+        sp = chunk;
+        while (sp && *sp) {
+            unsigned char ch = (unsigned char)*sp;
+            int adv = 1;
+            if ((ch & 0x80) == 0) adv = 1;
+            else if ((ch & 0xE0) == 0xC0) adv = sp[1] ? 2 : 1;
+            else if ((ch & 0xF0) == 0xE0) adv = (sp[1] && sp[2]) ? 3 : 1;
+            else if ((ch & 0xF8) == 0xF0) adv = (sp[1] && sp[2] && sp[3]) ? 4 : 1;
+            sp += adv;
+            cols += 1;
+        }
+        if (n > 0 && cols > 0 && x + cols < editor->rect_status.w) {
+            tb_print(x, editor->rect_status.y, th->git_fg, th->git_bg, chunk);
+            editor->status_git_x = x;
+            editor->status_git_w = cols;
+            x += cols;
+        }
+    }
+
+    if (editor->is_recording_macro) {
+        n = snprintf(chunk, sizeof(chunk), " REC ");
+        if (n > 0 && x + n < editor->rect_status.w) {
+            tb_print(x, editor->rect_status.y, th->err_fg, th->err_bg, chunk);
+            x += n;
+        }
+    } else if (editor->aprocs) {
+        n = snprintf(chunk, sizeof(chunk), " RUN ");
+        if (n > 0 && x + n < editor->rect_status.w) {
+            tb_print(x, editor->rect_status.y, classic ? (TB_BLACK | TB_BOLD) : th->pos_fg, classic ? TB_YELLOW : th->pos_bg, chunk);
+            x += n;
+        }
+    }
+    if (active->is_menu) {
+        n = snprintf(chunk, sizeof(chunk), " menu ");
+        if (n > 0 && x + n < editor->rect_status.w) tb_print(x, editor->rect_status.y, classic ? TB_BLACK : th->bar_fg, classic ? TB_WHITE : th->bar_bg, chunk);
+    }
+    (void)anchor_nlines;
 
     // Overlay errstr if present
 _bview_draw_status_end:
     if (editor->errstr[0] != '\0') {
         int errstrlen = strlen(editor->errstr) + 5; // Add 5 for "err! "
-        tb_printf_rect(editor->rect_status, editor->rect_status.w - errstrlen, 0, TB_WHITE | TB_BOLD, TB_RED, "err! %s", editor->errstr);
+        {
+            mle_theme_t *th = theme_current(editor);
+            tb_printf_rect(editor->rect_status, editor->rect_status.w - errstrlen, 0, th->err_fg, th->err_bg, "err! %s", editor->errstr);
+        }
         editor->errstr[0] = '\0'; // Clear errstr
     } else if (editor->infostr[0] != '\0') {
         int infostrlen = strlen(editor->infostr);
-        tb_printf_rect(editor->rect_status, editor->rect_status.w - infostrlen, 0, TB_WHITE, 0, "%s", editor->infostr);
+        {
+            mle_theme_t *th = theme_current(editor);
+            int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+            tb_printf_rect(editor->rect_status, editor->rect_status.w - infostrlen, 0, classic ? TB_WHITE : th->text_fg, classic ? 0 : th->bar_bg, "%s", editor->infostr);
+        }
         editor->infostr[0] = '\0'; // Clear errstr
     }
 }
@@ -994,9 +1055,21 @@ static void _bview_draw_edit(bview_t *self, int x, int y, int w, int h) {
         return;
     }
 
-    // Render caption
-    fg_attr = self->editor->active_edit == self ? TB_BOLD : 0;
-    bg_attr = self->editor->active_edit == self ? TB_BLUE : 0;
+    // Render caption. The stock mle theme keeps the old blue bar.
+    {
+        mle_theme_t *th = theme_current(self->editor);
+        int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+        if (self->editor->active_edit == self) {
+            fg_attr = classic ? TB_BOLD : th->caption_fg;
+            bg_attr = classic ? TB_BLUE : th->caption_bg;
+        } else if (classic) {
+            fg_attr = 0;
+            bg_attr = 0;
+        } else {
+            fg_attr = th->muted_fg;
+            bg_attr = th->muted_bg;
+        }
+    }
     tb_printf_rect(self->rect_caption, 0, 0, fg_attr, bg_attr, "%*.*s", self->rect_caption.w, self->rect_caption.w, " ");
     if (self->buffer->path) {
         tb_printf_rect(self->rect_caption, 0, 0, fg_attr, bg_attr, "%*.s%s %c",
@@ -1014,10 +1087,14 @@ static void _bview_draw_edit(bview_t *self, int x, int y, int w, int h) {
     for (rect_y = 0; rect_y < self->rect_buffer.h; rect_y++) {
         if (viewport_y + rect_y < 0 || viewport_y + rect_y >= self->buffer->line_count) {
             // Draw pre/post blank
-            tb_printf_rect(self->rect_lines, 0, rect_y, 0, 0, "%*c", self->linenum_width, '~');
-            tb_printf_rect(self->rect_margin_left, 0, rect_y, 0, 0, "%c", ' ');
-            tb_printf_rect(self->rect_margin_right, 0, rect_y, 0, 0, "%c", ' ');
-            tb_printf_rect(self->rect_buffer, 0, rect_y, 0, 0, "%-*.*s", self->rect_buffer.w, self->rect_buffer.w, " ");
+            mle_theme_t *th = theme_current(self->editor);
+            int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+            int bfg = classic ? 0 : th->text_fg;
+            int bbg = classic ? 0 : th->text_bg;
+            if (self->linenum_width > 0) tb_printf_rect(self->rect_lines, 0, rect_y, bfg, bbg, "%*c", self->linenum_width, '~');
+            tb_printf_rect(self->rect_margin_left, 0, rect_y, bfg, bbg, "%c", ' ');
+            tb_printf_rect(self->rect_margin_right, 0, rect_y, bfg, bbg, "%c", ' ');
+            tb_printf_rect(self->rect_buffer, 0, rect_y, bfg, bbg, "%-*.*s", self->rect_buffer.w, self->rect_buffer.w, " ");
         } else {
             // Draw bline at self->rect_buffer self->viewport_mark + rect_y
             _bview_draw_bline(self, bline, rect_y, &bline, &rect_y);
@@ -1049,22 +1126,38 @@ static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t
     viewport_x_vcol = MLE_COL_TO_VCOL(bline, viewport_x);
 
     // Draw linenums and margins
-    if (MLE_BVIEW_IS_EDIT(self)) {
+    if (MLE_BVIEW_IS_EDIT(self) && self->linenum_width > 0) {
+        mle_theme_t *th = theme_current(self->editor);
+        int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
         int linenum_fg = is_cursor_line ? TB_BOLD : 0;
+        int linenum_bg = 0;
+        if (!classic) {
+            linenum_fg = th->text_fg;
+            if (is_cursor_line) linenum_fg |= TB_BOLD;
+            linenum_bg = th->text_bg;
+            if (self->editor->hl_line && is_cursor_line && !self->is_menu) linenum_bg = th->line_bg;
+        }
         if (self->editor->linenum_type == MLE_LINENUM_TYPE_ABS
             || self->editor->linenum_type == MLE_LINENUM_TYPE_BOTH
             || (self->editor->linenum_type == MLE_LINENUM_TYPE_REL && is_cursor_line)
         ) {
-            tb_printf_rect(self->rect_lines, 0, rect_y, linenum_fg, 0, "%*d", self->abs_linenum_width, (int)(bline->line_index + 1) % (int)pow(10, self->linenum_width));
+            tb_printf_rect(self->rect_lines, 0, rect_y, linenum_fg, linenum_bg, "%*d", self->abs_linenum_width, (int)(bline->line_index + 1) % (int)pow(10, self->linenum_width));
             if (self->editor->linenum_type == MLE_LINENUM_TYPE_BOTH) {
-                tb_printf_rect(self->rect_lines, self->abs_linenum_width, rect_y, linenum_fg, 0, " %*d", self->rel_linenum_width, (int)labs(bline->line_index - self->active_cursor->mark->bline->line_index));
+                tb_printf_rect(self->rect_lines, self->abs_linenum_width, rect_y, linenum_fg, linenum_bg, " %*d", self->rel_linenum_width, (int)labs(bline->line_index - self->active_cursor->mark->bline->line_index));
             }
         } else if (self->editor->linenum_type == MLE_LINENUM_TYPE_REL) {
-            tb_printf_rect(self->rect_lines, 0, rect_y, linenum_fg, 0, "%*d", self->rel_linenum_width, (int)labs(bline->line_index - self->active_cursor->mark->bline->line_index));
+            tb_printf_rect(self->rect_lines, 0, rect_y, linenum_fg, linenum_bg, "%*d", self->rel_linenum_width, (int)labs(bline->line_index - self->active_cursor->mark->bline->line_index));
         }
-        tb_printf_rect(self->rect_margin_left, 0, rect_y, 0, 0, "%c", viewport_x > 0 && bline->char_count > 0 ? '^' : ' ');
+    }
+    if (MLE_BVIEW_IS_EDIT(self)) {
+        mle_theme_t *th = theme_current(self->editor);
+        int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+        int mfg = classic ? 0 : th->muted_fg;
+        int mbg = classic ? 0 : th->text_bg;
+        if (!classic && self->editor->hl_line && is_cursor_line && !self->is_menu) mbg = th->line_bg;
+        tb_printf_rect(self->rect_margin_left, 0, rect_y, mfg, mbg, "%c", viewport_x > 0 && bline->char_count > 0 ? '^' : ' ');
         if (!is_soft_wrapped && bline->char_vwidth - viewport_x_vcol > self->rect_buffer.w) {
-            tb_printf_rect(self->rect_margin_right, 0, rect_y, 0, 0, "%c", '$');
+            tb_printf_rect(self->rect_margin_right, 0, rect_y, mfg, mbg, "%c", '$');
         }
     }
 
@@ -1097,6 +1190,13 @@ static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t
         if (srule) {
             fg = srule->style.fg;
             bg = srule->style.bg;
+        } else if (MLE_BVIEW_IS_EDIT(self) || MLE_BVIEW_IS_PROMPT(self)) {
+            mle_theme_t *th = theme_current(self->editor);
+            fg = theme_synth(self->editor, (uint16_t)fg, 1);
+            bg = theme_synth(self->editor, (uint16_t)bg, 0);
+            if (self->editor->hl_line && is_cursor_line && !self->is_menu) {
+                if ((bg & 0xff) == (th->text_bg & 0xff)) bg = th->line_bg;
+            }
         }
         // Draw char_w chars of ch
         for (i = 0; i < char_w && rect_x + i < self->rect_buffer.w; i++) {
@@ -1134,6 +1234,16 @@ static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t
         }
         rect_x += char_w;
         char_col += 1;
+    }
+    if (MLE_BVIEW_IS_EDIT(self) && rect_y < self->rect_buffer.h) {
+        mle_theme_t *th = theme_current(self->editor);
+        int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+        int fill_fg = classic ? 0 : (self->editor->hl_line && is_cursor_line && !self->is_menu ? th->line_fg : th->text_fg);
+        int fill_bg = classic ? 0 : th->text_bg;
+        if (!classic && self->editor->hl_line && is_cursor_line && !self->is_menu) fill_bg = th->line_bg;
+        for (i = rect_x; i < self->rect_buffer.w; i++) {
+            tb_set_cell(self->rect_buffer.x + i, self->rect_buffer.y + rect_y, ' ', fill_fg, fill_bg);
+        }
     }
     for (i = orig_rect_y; i < rect_y && bline->next; i++) {
         bline = bline->next;

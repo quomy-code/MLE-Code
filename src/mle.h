@@ -87,12 +87,14 @@ struct editor_s {
     cmd_t *cmd_map;
     kmap_t *kmap_map;
     kmap_t *kmap_normal;
+    kmap_t *kmap_basic;
     kmap_t *kmap_prompt_input;
     kmap_t *kmap_prompt_yn;
     kmap_t *kmap_prompt_yna;
     kmap_t *kmap_prompt_ok;
     kmap_t *kmap_prompt_isearch;
     kmap_t *kmap_menu;
+    kmap_t *kmap_options;
     prompt_history_t *prompt_history;
     char *kmap_init_name;
     kmap_t *kmap_init;
@@ -113,6 +115,9 @@ struct editor_s {
     int soft_wrap;
     int coarse_undo;
     int mouse_support;
+    int mouse_copy;
+    int hl_line;
+    int theme_i;
     int viewport_scope_x; // TODO cli option
     int viewport_scope_y; // TODO cli option
     int headless_mode;
@@ -136,6 +141,13 @@ struct editor_s {
     char display_keys_buf[MLE_DISPLAY_KEYS_NKEYS * MLE_MAX_KEYNAME_LEN];
     int exit_code;
     struct iterm_panel_s *iterm;
+    struct side_panel_s *side;
+    int status_file_x;
+    int status_file_w;
+    int status_git_x;
+    int status_git_w;
+    int status_pos_x;
+    int status_pos_w;
 };
 
 // srule_def_t
@@ -440,11 +452,15 @@ int editor_debug_dump(editor_t *editor, FILE *fp);
 int editor_force_redraw(editor_t *editor);
 int editor_set_input_mode(editor_t *editor);
 int editor_input_to_key(kinput_t *input, char *keyname);
+int editor_bind(editor_t *editor, char *kmap_name, char *cmd_name, char *key_patt, char *static_param);
+void editor_add_syntax(editor_t *editor, char *name, char *path_pattern, srule_def_t *defs);
+void syntax_extra_init(editor_t *editor);
 int editor_relayout(editor_t *editor);
 
 // Integrated terminal. The panel is created on first use.
 struct iterm_panel_s;
 int iterm_running(editor_t *editor);
+int iterm_visible(editor_t *editor);
 void iterm_apply_layout(editor_t *editor, bview_rect_t *edit);
 void iterm_draw(editor_t *editor);
 int iterm_handle_key(editor_t *editor, struct tb_event *ev);
@@ -454,11 +470,85 @@ int iterm_pty_fds(editor_t *editor, int *fds, int cap);
 void iterm_drain_fd(editor_t *editor, int fd);
 void iterm_shutdown(editor_t *editor);
 int iterm_action(editor_t *editor, const char *action);
+int iterm_dragging(editor_t *editor);
+const char *iterm_dock_name(editor_t *editor);
 int cmd_iterm(cmd_context_t *ctx);
 int iterm_debug_feed(const char *bytes, int len, int cols, int rows, char *out, int out_cap);
 int iterm_debug_cell(const char *bytes, int len, int cols, int rows, int x, int y, uint32_t *ch, int *fg, int *bg, int *attr);
 int iterm_debug_resize(const char *bytes, int len, int cols, int rows, int cols2, int rows2, char *out, int out_cap);
 int iterm_debug_pty(char *out, int out_cap);
+
+// Left-hand file explorer and git panel.
+struct side_panel_s;
+void side_init(editor_t *editor);
+void side_shutdown(editor_t *editor);
+void side_apply_layout(editor_t *editor, bview_rect_t *edit);
+void side_draw(editor_t *editor);
+int side_place_cursor(editor_t *editor);
+int side_handle_key(editor_t *editor, struct tb_event *ev);
+int side_handle_mouse(editor_t *editor, struct tb_event *ev);
+int side_action(editor_t *editor, const char *action);
+void side_git_label(editor_t *editor, char *buf, size_t n);
+const char *side_guide_text(void);
+int cmd_side(cmd_context_t *ctx);
+int cmd_guide(cmd_context_t *ctx);
+
+/* Symbol packs compiled into the binary. plain is ASCII.
+   marks is Unicode. slab and line are 8x8 bitmap fonts drawn as braille. */
+enum {
+    GLY_BRANCH = 0,
+    GLY_DIR_OPEN,
+    GLY_DIR_SHUT,
+    GLY_RIGHT,
+    GLY_LEFT,
+    GLY_UP,
+    GLY_DOWN,
+    GLY_PLUS,
+    GLY_CLOSE,
+    GLY_HUNK,
+    GLY_MOD,
+    GLY_ADD,
+    GLY_DEL,
+    GLY_UNTRACK,
+    GLY_RENAME,
+    GLY_STAGED,
+    GLY_COUNT
+};
+int glyphs_decor(void);
+uint32_t glyphs_cp(int id);
+int glyphs_utf8(int id, char *dst, int cap);
+const char *glyphs_name(void);
+void glyphs_cycle(void);
+
+typedef struct mle_theme_s {
+    char name[24];
+    int user;
+    uint16_t text_fg, text_bg;
+    uint16_t comment, string, number, keyword, preproc, punct;
+    uint16_t sel_fg, sel_bg;
+    uint16_t file_fg, file_bg;
+    uint16_t pos_fg, pos_bg;
+    uint16_t git_fg, git_bg;
+    uint16_t accent_fg, accent_bg;
+    uint16_t muted_fg, muted_bg;
+    uint16_t line_fg, line_bg;
+    uint16_t grip_fg, grip_bg;
+    uint16_t err_fg, err_bg;
+    uint16_t bar_fg, bar_bg;
+    uint16_t caption_fg, caption_bg;
+    uint16_t dir_fg, dir_bg;
+} mle_theme_t;
+
+void theme_init(editor_t *editor);
+mle_theme_t *theme_current(editor_t *editor);
+const char *theme_name(editor_t *editor);
+void theme_selection(editor_t *editor, uint16_t *fg, uint16_t *bg);
+uint16_t theme_synth(editor_t *editor, uint16_t attr, int is_fg);
+void theme_cycle(editor_t *editor);
+int theme_create(editor_t *editor, const char *name);
+int theme_paint(editor_t *editor, const char *spec);
+void theme_restyle(editor_t *editor);
+const char *theme_paint_help(void);
 
 // bview functions
 bview_t *bview_get_split_root(bview_t *self);
@@ -487,16 +577,20 @@ int bview_set_viewport_y(bview_t *self, bint_t y, int do_rectify);
 int bview_split(bview_t *self, int is_vertical, float factor, bview_t **optret_bview);
 int bview_wake_sleeping_cursors(bview_t *self);
 int bview_zero_viewport_y(bview_t *self);
+int bview_sync_linenums(bview_t *self);
 
 // cursor functions
 int cursor_clone(cursor_t *cursor, int use_srules, cursor_t **ret_clone);
 int cursor_cut_copy(cursor_t *cursor, int is_cut, int use_srules, int append);
+int cursor_copy_anchor(cursor_t *cursor, int to_clipboard);
+int cursor_paste_clipboard(cursor_t *cursor);
 int cursor_destroy(cursor_t *cursor);
 int cursor_drop_anchor(cursor_t *cursor, int use_srules);
 int cursor_get_lo_hi(cursor_t *cursor, mark_t **ret_lo, mark_t **ret_hi);
 int cursor_get_mark(cursor_t *cursor, mark_t **ret_mark);
 int cursor_get_anchor(cursor_t *cursor, mark_t **ret_anchor);
 int cursor_lift_anchor(cursor_t *cursor);
+int cursor_eat_selection(cursor_t *cursor);
 int cursor_replace(cursor_t *cursor, int interactive, char *opt_regex, char *opt_replacement);
 int cursor_replace_ex(cursor_t *cursor, int interactive, char *opt_regex, char *opt_replacement, char *opt_cmd_name, int *inout_all, int *optret_num_replacements, int *optret_cancelled);
 int cursor_select_between(cursor_t *cursor, mark_t *a, mark_t *b, int use_srules);
@@ -596,6 +690,9 @@ int cmd_search(cmd_context_t *ctx);
 int cmd_search_next(cmd_context_t *ctx);
 int cmd_search_prev(cmd_context_t *ctx);
 int cmd_set_opt(cmd_context_t *ctx);
+int cmd_options(cmd_context_t *ctx);
+int cmd_options_dismiss(cmd_context_t *ctx);
+int cmd_paste_sys(cmd_context_t *ctx);
 int cmd_shell(cmd_context_t *ctx);
 int cmd_show_help(cmd_context_t *ctx);
 int cmd_split_horizontal(cmd_context_t *ctx);
@@ -619,6 +716,7 @@ aproc_t *aproc_new(editor_t *editor, void *owner, aproc_t **owner_aproc, char *s
 int aproc_set_owner(aproc_t *aproc, void *owner, aproc_t **owner_aproc);
 int aproc_destroy(aproc_t *aproc, int preempt);
 int aproc_drain_all(aproc_t *aprocs, int *ttyfd);
+int aproc_read_ready(aproc_t *aproc);
 
 // uscript functions
 uscript_t *uscript_run(editor_t *editor, char *path);
@@ -633,6 +731,8 @@ int util_is_dir(char *path);
 int util_pcre_match(char *re, char *subject, int subject_len, char **optret_capture, int *optret_capture_len);
 int util_pcre_replace(char *re, char *subj, char *repl, char **ret_result, int *ret_result_len);
 int util_timeval_is_gt(struct timeval *a, struct timeval *b);
+int util_clipboard_set(const char *text, size_t len);
+int util_clipboard_get(char **out, size_t *out_len);
 char *util_escape_shell_arg(char *str, int l);
 void util_expand_tilde(char *path, int path_len, char **ret_path, int *ret_path_len);
 int tb_printf_rect(bview_rect_t rect, int x, int y, uint16_t fg, uint16_t bg, const char *fmt, ...);
@@ -665,7 +765,7 @@ extern editor_t _editor;
 #define MLE_DEFAULT_READ_RC_FILE 1
 #define MLE_DEFAULT_SOFT_WRAP 0
 #define MLE_DEFAULT_COARSE_UNDO 0
-#define MLE_DEFAULT_MOUSE_SUPPORT 0
+#define MLE_DEFAULT_MOUSE_SUPPORT 1
 
 #define MLE_LOG_ERR(fmt, ...) do { \
     fprintf(stderr, (fmt), __VA_ARGS__); \
@@ -721,6 +821,7 @@ extern editor_t _editor;
 #define MLE_LINENUM_TYPE_ABS 0
 #define MLE_LINENUM_TYPE_REL 1
 #define MLE_LINENUM_TYPE_BOTH 2
+#define MLE_LINENUM_TYPE_NONE -1
 
 #define MLE_PARAM_WILDCARD(pctx, pn) ( \
     (pn) < (pctx)->wildcard_params_len \

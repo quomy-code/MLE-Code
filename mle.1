@@ -11,8 +11,9 @@
 .Li ...
 .Sh DESCRIPTION
 .Nm
-is a small, flexible, terminal-based text editor written in C.
-It runs on Linux, Windows (Cygwin or WSL), FreeBSD, macOS, and more.
+is MLE Code, a small, flexible, terminal-based text editor written in C.
+The original editor is mle by adsr. This version is maintained by quomy.
+It runs on Linux, Windows (Cygwin, MSYS2, or WSL), FreeBSD, macOS, and more.
 .Ss Basic usage
 .Bd -literal
   $ mle             # Open blank buffer
@@ -27,6 +28,42 @@ Input text as normal, use directional keys to move around, use
 `Ctrl-S` to save, `Ctrl-O` to open, `Ctrl-X` to exit.
 .Pp
 Press `F2` for full help.
+.Ss Integrated terminal
+Press `F7` or Alt-grave to toggle a terminal panel docked along the bottom
+of the window. Ctrl-Shift-grave does the same when the host terminal sends
+that chord as its own sequence. Drag the bar between the editor and the
+shell to resize the panel. `+` on the tab row opens another shell and `x`
+on a tab closes that shell. While the panel is focused, keys are sent
+to the shell, so Ctrl-C still interrupts the command.
+`Alt-t` is the command prefix (`Alt-t ?` lists commands) and `Alt-T` opens
+another terminal. `Shift-PgUp` scrolls history. Shift-arrows select text.
+`Ctrl-PgUp` switches tabs.
+`Alt-t y` copies a selection into the editor cut buffer and the system
+clipboard. `Shift-Insert` pastes the clipboard.
+The panel can dock on any edge, fill the window, and split.
+`F8` opens the settings menu and leaves it open until Escape or the close row.
+Mouse selection defaults to on; disable it with
+.Fl e0
+or `M-o m`.
+Drag selects the letters under the pointer. Double-click selects a word and
+triple-click selects a line.
+`F9` toggles the file list on the left. `/` asks for a folder.
+`F10` toggles git status in that list. The line under the branch is the
+GitHub account. If gh or git already has one, mle uses it. `g`, `[`, `]`,
+Left, and Right switch accounts. `n` starts a login. Type a username, then
+a password or a GitHub personal access token. `N` forgets a login stored
+by mle. The next line is the commit message. Commit, Push, and Pull are
+buttons. Click a file to see what changed and which line. Push and discard
+ask you to type yes. Pull does not. Escape leaves the field, then the list.
+`F8` symbols cycles plain, marks, and two bitmap fonts built into mle.
+`F1` opens a short guide. The status bar shows the file, the cursor, and the
+branch. Click those fields to list buffers, jump to a line, or open git.
+Everyday keys are arrows, Ctrl-S, Ctrl-O, Ctrl-X, Ctrl-Z, Ctrl-F, Ctrl-K,
+and Ctrl-U. Every other binding still works. `F2` lists them.
+`F8` also cycles six themes (mle, paper, night, forest, ember, ocean).
+`newtheme` copies the current theme and `painttheme` sets one color.
+User themes are stored in `~/.mle/themes`.
+Syntax highlighting includes per-language rules and a fallback for other files.
 .Ss Options
 .Bl -tag -width ".Fl foo barbaz" -offset indent
 .It Fl h
@@ -38,7 +75,7 @@ Enable/disable highlight bracket pairs (default: 1)
 .It Fl c Ar column
 Color column (default: -1, disabled)
 .It Fl e Aq 1|0
-Enable/disable mouse support (default: 0)
+Enable/disable mouse support (default: 1)
 .It Fl H Aq 1|0
 Enable/disable headless mode (default: 1 if no tty, else 0)
 .It Fl i Aq 1|0

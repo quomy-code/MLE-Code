@@ -47,6 +47,8 @@ static int _cmd_menu_grep_cb(cmd_context_t *ctx);
 static int _cmd_menu_ctag_cb(cmd_context_t *ctx);
 static int _cmd_menu_browse_cb(cmd_context_t *ctx);
 static int _cmd_menu_blist_cb(cmd_context_t *ctx);
+static int _cmd_menu_options_cb(cmd_context_t *ctx);
+static void opt_refresh(cmd_context_t *ctx);
 static void _cmd_insert_auto_indent_newline(cmd_context_t *ctx);
 static void _cmd_insert_auto_indent_closing_bracket(cmd_context_t *ctx);
 static void _cmd_shell_apply_cmd(cmd_context_t *ctx, char *cmd);
@@ -105,6 +107,10 @@ int cmd_insert_data(cmd_context_t *ctx) {
     }
     ctx->editor->insertbuf[insertbuf_len] = '\0';
 
+    MLE_FOREACH_CURSOR(ctx->cursor) {
+        cursor_eat_selection(cursor);
+    }
+
     // Insert
     mark_insert_func = ctx->cursor->is_block ? mark_block_insert_before : mark_insert_before;
     if (insertbuf_len > 1
@@ -158,6 +164,12 @@ int cmd_insert_newline_below(cmd_context_t *ctx) {
 // Delete char before cursor mark
 int cmd_delete_before(cmd_context_t *ctx) {
     bint_t offset;
+    int ate;
+    ate = 0;
+    MLE_FOREACH_CURSOR(ctx->cursor) {
+        if (cursor_eat_selection(cursor)) ate = 1;
+    }
+    if (ate) return MLE_OK;
     mark_get_offset(ctx->cursor->mark, &offset);
     if (offset < 1) return MLE_OK;
     MLE_FOREACH_CURSOR_MARK_FN(ctx->cursor, mark_delete_before, 1);
@@ -166,6 +178,12 @@ int cmd_delete_before(cmd_context_t *ctx) {
 
 // Delete char after cursor mark
 int cmd_delete_after(cmd_context_t *ctx) {
+    int ate;
+    ate = 0;
+    MLE_FOREACH_CURSOR(ctx->cursor) {
+        if (cursor_eat_selection(cursor)) ate = 1;
+    }
+    if (ate) return MLE_OK;
     MLE_FOREACH_CURSOR_MARK_FN(ctx->cursor, mark_delete_after, 1);
     return MLE_OK;
 }
@@ -832,11 +850,12 @@ int cmd_grep(cmd_context_t *ctx) {
     }
     path_arg = util_escape_shell_arg(path, strlen(path));
     free(path);
-    asprintf(&cmd, grep_fmt, path_arg);
-    free(path_arg);
-    if (!cmd) {
+    cmd = NULL;
+    if (!path_arg || asprintf(&cmd, grep_fmt, path_arg) < 0 || !cmd) {
+        free(path_arg);
         MLE_RETURN_ERR(ctx->editor, "Failed to format grep cmd: %s", grep_fmt);
     }
+    free(path_arg);
 
     aproc = aproc_new(ctx->editor, ctx->bview, &(ctx->bview->aproc), cmd, 0, _cmd_aproc_bview_passthru_cb);
     free(cmd);
@@ -855,15 +874,17 @@ int cmd_ctag(cmd_context_t *ctx) {
     if (cursor_select_by(ctx->cursor, "word", 0) != MLE_OK) {
         MLE_RETURN_ERR(ctx->editor, "%s", "Failed to select word under cursor");
     }
+    word = NULL;
     mark_get_between(ctx->cursor->mark, ctx->cursor->anchor, &word, &word_len);
     cursor_toggle_anchor(ctx->cursor, 0);
-    word_arg = util_escape_shell_arg(word, word_len);
+    word_arg = word ? util_escape_shell_arg(word, word_len) : NULL;
     free(word);
-    asprintf(&cmd, "readtags -e - %s 2>/dev/null", word_arg);
-    free(word_arg);
-    if (!cmd) {
+    cmd = NULL;
+    if (!word_arg || asprintf(&cmd, "readtags -e - %s 2>/dev/null", word_arg) < 0 || !cmd) {
+        free(word_arg);
         MLE_RETURN_ERR(ctx->editor, "%s", "Failed to format readtags cmd");
     }
+    free(word_arg);
     aproc = aproc_new(ctx->editor, ctx->bview, &(ctx->bview->aproc), cmd, 0, _cmd_aproc_bview_passthru_cb);
     free(cmd);
     if (!aproc) return MLE_ERR;
@@ -879,7 +900,11 @@ int cmd_browse(cmd_context_t *ctx) {
     char *browse_path, *browse_path_esc;
     browse_path = ctx->static_param ? ctx->static_param : "./";
     browse_path_esc = util_escape_shell_arg(browse_path, strlen(browse_path));
-    asprintf(&cmd, "cd %s && tree --charset C -n -f -L 2 2>/dev/null", browse_path_esc);
+    cmd = NULL;
+    if (!browse_path_esc || asprintf(&cmd, "cd %s && tree --charset C -n -f -L 2 2>/dev/null", browse_path_esc) < 0 || !cmd) {
+        free(browse_path_esc);
+        return MLE_ERR;
+    }
     free(browse_path_esc);
     aproc = aproc_new(ctx->editor, ctx->bview, &(ctx->bview->aproc), cmd, 0, _cmd_aproc_bview_passthru_cb);
     free(cmd);
@@ -1211,6 +1236,334 @@ int cmd_set_opt(cmd_context_t *ctx) {
     return MLE_OK;
 }
 
+static bview_t *g_opt_bview;
+
+static int opt_tok(const char *line, const char *name) {
+    size_t n;
+    if (!line || !name) return 0;
+    while (*line == ' ' || *line == '\t') line++;
+    n = strlen(name);
+    if (strncmp(line, name, n) != 0) return 0;
+    return line[n] == '\0' || line[n] == ' ' || line[n] == '\t' || line[n] == '\n';
+}
+
+static const char *opt_onoff(int v) {
+    return v ? "on" : "off";
+}
+
+static bview_t *opt_target(editor_t *editor) {
+    if (g_opt_bview && !g_opt_bview->is_menu) return g_opt_bview;
+    if (editor->active_edit && !editor->active_edit->is_menu) return editor->active_edit;
+    return editor->active_edit_last;
+}
+
+static void opt_close(cmd_context_t *ctx) {
+    bview_t *target;
+    bview_t *menu;
+    target = opt_target(ctx->editor);
+    menu = ctx->bview;
+    editor_close_bview(ctx->editor, menu, NULL);
+    if (target && target != menu) editor_set_active(ctx->editor, target);
+}
+
+int cmd_options_dismiss(cmd_context_t *ctx) {
+    if (!ctx->bview || !ctx->bview->is_menu) return MLE_OK;
+    opt_close(ctx);
+    return MLE_OK;
+}
+
+static const char *opt_lines(int t) {
+    if (t == MLE_LINENUM_TYPE_REL) return "relative";
+    if (t == MLE_LINENUM_TYPE_BOTH) return "both";
+    if (t == MLE_LINENUM_TYPE_NONE) return "off";
+    return "absolute";
+}
+
+static void opt_sync_lines(editor_t *editor) {
+    bview_t *bv;
+    CDL_FOREACH2(editor->all_bviews, bv, all_next) {
+        if (MLE_BVIEW_IS_EDIT(bv) && !bv->split_parent) bview_sync_linenums(bv);
+    }
+}
+
+static void opt_build(editor_t *editor, str_t *menu) {
+    bview_t *bv;
+    char row[192];
+    int lines;
+    bv = opt_target(editor);
+    lines = editor->linenum_type;
+    str_append(menu, "  settings    enter applies a row and stays here. esc or close leaves\n");
+    snprintf(row, sizeof(row), "  mouse       selection and clicks                                  %s\n", opt_onoff(editor->mouse_support));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  dragcopy    copy to the clipboard when a drag is released         %s\n", opt_onoff(editor->mouse_copy));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  tabspace    Tab inserts spaces                                    %s\n", opt_onoff(bv ? bv->tab_to_space : editor->tab_to_space));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  tabwidth    columns per tab                                       %d\n", bv ? bv->tab_width : editor->tab_width);
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  syntax      highlighting for this buffer                          %s\n", (bv && bv->buffer && bv->buffer->is_style_disabled) ? "off" : "on");
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  wrap        soft wrap                                             %s\n", opt_onoff(bv ? bv->soft_wrap : editor->soft_wrap));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  undo        coarse undo groups                                    %s\n", opt_onoff(editor->coarse_undo));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  linenums    line number gutter                                    %s\n", opt_lines(lines));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  autoindent  indent a new line like the line above                 %s\n", opt_onoff(editor->auto_indent));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  brackets    highlight the matching bracket                        %s\n", opt_onoff(editor->highlight_bracket_pairs));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  trimpaste   strip trailing spaces from a pasted block             %s\n", opt_onoff(editor->trim_paste));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  colorcol    ruler column                                          %d\n", editor->color_col);
+    str_append(menu, row);
+    str_append(menu, "  explorer    folder list on the left. f9 shows or hides it\n");
+    str_append(menu, "  git         changed files in the side panel. f10\n");
+    snprintf(row, sizeof(row), "  terminal    shell panel   f7 or Alt-grave                         %s\n", iterm_visible(editor) ? "shown" : "hidden");
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  termdock    where the terminal sits                               %s\n", iterm_dock_name(editor));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  theme       color theme                                           %s\n", theme_name(editor));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  hlline      shade the line the cursor is on                       %s\n", opt_onoff(editor->hl_line));
+    str_append(menu, row);
+    snprintf(row, sizeof(row), "  symbols     arrows and two built-in fonts                         %s\n", glyphs_name());
+    str_append(menu, row);
+    str_append(menu, "  newtheme    copy this theme under a new name\n");
+    str_append(menu, "  painttheme  set one color, for example comment bold cyan\n");
+    str_append(menu, "  basics      everyday keys. every other binding still works\n");
+    str_append(menu, "  guide       short guide in the side panel. f1 opens the full page\n");
+    str_append(menu, "  copy        copy the selection, or the whole line\n");
+    str_append(menu, "  paste       paste the system clipboard\n");
+    str_append(menu, "  rebind      bind a command to the next key\n");
+    str_append(menu, "  close       leave settings\n");
+}
+
+static int _cmd_menu_options_cb(cmd_context_t *ctx) {
+    char *line;
+    bview_t *bv;
+    editor_t *editor;
+    editor = ctx->editor;
+    line = ctx->bview->active_cursor->mark->bline->data;
+    bv = opt_target(editor);
+    if (opt_tok(line, "settings")) {
+        MLE_SET_INFO(editor, "%s", "settings: move to a row and press enter");
+        return MLE_OK;
+    }
+    if (opt_tok(line, "mouse")) {
+        editor->mouse_support = editor->mouse_support ? 0 : 1;
+        editor_set_input_mode(editor);
+        MLE_SET_INFO(editor, "mouse selection %s", opt_onoff(editor->mouse_support));
+    } else if (opt_tok(line, "tabspace") && bv) {
+        int on = bv->tab_to_space ? 0 : 1;
+        bv->tab_to_space = on;
+        editor->tab_to_space = on;
+        MLE_SET_INFO(editor, "tab inserts spaces %s", opt_onoff(on));
+    } else if (opt_tok(line, "tabwidth") && bv) {
+        char *val = NULL;
+        int w;
+        editor_prompt(editor, "tab width?", NULL, &val);
+        if (!val) return MLE_OK;
+        w = atoi(val);
+        free(val);
+        if (w < 1) w = 1;
+        if (w > 32) w = 32;
+        editor->tab_width = w;
+        bv->tab_width = w;
+        if (bv->buffer) buffer_set_tab_width(bv->buffer, w);
+        MLE_SET_INFO(editor, "tab width %d", w);
+    } else if (opt_tok(line, "syntax") && bv && bv->buffer) {
+        if (bv->buffer->is_style_disabled) {
+            buffer_set_styles_enabled(bv->buffer, 1);
+            bview_set_syntax(bv, NULL);
+            MLE_SET_INFO(editor, "%s", "syntax highlighting on");
+        } else {
+            buffer_set_styles_enabled(bv->buffer, 0);
+            MLE_SET_INFO(editor, "%s", "syntax highlighting off");
+        }
+    } else if (opt_tok(line, "wrap") && bv) {
+        int on = bv->soft_wrap ? 0 : 1;
+        bv->soft_wrap = on;
+        editor->soft_wrap = on;
+        MLE_SET_INFO(editor, "soft wrap %s", opt_onoff(on));
+    } else if (opt_tok(line, "undo")) {
+        editor->coarse_undo = editor->coarse_undo ? 0 : 1;
+        MLE_SET_INFO(editor, "coarse undo %s", opt_onoff(editor->coarse_undo));
+    } else if (opt_tok(line, "linenums")) {
+        int t = editor->linenum_type;
+        if (t == MLE_LINENUM_TYPE_ABS) t = MLE_LINENUM_TYPE_REL;
+        else if (t == MLE_LINENUM_TYPE_REL) t = MLE_LINENUM_TYPE_BOTH;
+        else if (t == MLE_LINENUM_TYPE_BOTH) t = MLE_LINENUM_TYPE_NONE;
+        else t = MLE_LINENUM_TYPE_ABS;
+        editor->linenum_type = t;
+        opt_sync_lines(editor);
+        MLE_SET_INFO(editor, "line numbers %s", opt_lines(t));
+    } else if (opt_tok(line, "autoindent")) {
+        editor->auto_indent = editor->auto_indent ? 0 : 1;
+        MLE_SET_INFO(editor, "auto indent %s", opt_onoff(editor->auto_indent));
+    } else if (opt_tok(line, "brackets")) {
+        editor->highlight_bracket_pairs = editor->highlight_bracket_pairs ? 0 : 1;
+        MLE_SET_INFO(editor, "bracket highlight %s", opt_onoff(editor->highlight_bracket_pairs));
+    } else if (opt_tok(line, "trimpaste")) {
+        editor->trim_paste = editor->trim_paste ? 0 : 1;
+        MLE_SET_INFO(editor, "trim paste %s", opt_onoff(editor->trim_paste));
+    } else if (opt_tok(line, "colorcol")) {
+        char *val = NULL;
+        int col;
+        editor_prompt(editor, "ruler column? 0 hides it", NULL, &val);
+        if (!val) return MLE_OK;
+        col = atoi(val);
+        free(val);
+        editor->color_col = col < 1 ? -1 : col;
+        MLE_SET_INFO(editor, "ruler column %d", editor->color_col);
+    } else if (opt_tok(line, "dragcopy")) {
+        editor->mouse_copy = editor->mouse_copy ? 0 : 1;
+        MLE_SET_INFO(editor, "copy on release %s", opt_onoff(editor->mouse_copy));
+    } else if (opt_tok(line, "explorer")) {
+        side_action(editor, "toggle");
+        MLE_SET_INFO(editor, "%s", "explorer toggled");
+    } else if (opt_tok(line, "git")) {
+        side_action(editor, "git");
+        MLE_SET_INFO(editor, "%s", "git panel toggled");
+    } else if (opt_tok(line, "guide")) {
+        side_action(editor, "guide");
+        MLE_SET_INFO(editor, "%s", "guide is in the side panel. f1 opens the page");
+    } else if (opt_tok(line, "close")) {
+        opt_close(ctx);
+        return MLE_OK;
+    } else if (opt_tok(line, "terminal")) {
+        iterm_action(editor, "toggle");
+        MLE_SET_INFO(editor, "terminal %s", iterm_visible(editor) ? "shown" : "hidden");
+    } else if (opt_tok(line, "termdock")) {
+        iterm_action(editor, "dockcycle");
+        MLE_SET_INFO(editor, "terminal dock %s", iterm_dock_name(editor));
+    } else if (opt_tok(line, "theme")) {
+        theme_cycle(editor);
+        MLE_SET_INFO(editor, "theme %s", theme_name(editor));
+    } else if (opt_tok(line, "newtheme")) {
+        char *name = NULL;
+        editor_prompt(editor, "new theme name?", NULL, &name);
+        if (!name) return MLE_OK;
+        if (!name[0] || theme_create(editor, name) != 0) MLE_SET_ERR(editor, "%s", "theme: could not create");
+        else MLE_SET_INFO(editor, "theme %s", theme_name(editor));
+        free(name);
+    } else if (opt_tok(line, "painttheme")) {
+        char *spec = NULL;
+        editor_prompt(editor, "paint: comment bold cyan", NULL, &spec);
+        if (!spec) return MLE_OK;
+        if (theme_paint(editor, spec) != 0) MLE_SET_ERR(editor, "%s", "theme: could not paint");
+        else MLE_SET_INFO(editor, "theme %s", theme_name(editor));
+        free(spec);
+    } else if (opt_tok(line, "hlline")) {
+        editor->hl_line = editor->hl_line ? 0 : 1;
+        MLE_SET_INFO(editor, "cursor line %s", opt_onoff(editor->hl_line));
+    } else if (opt_tok(line, "symbols")) {
+        glyphs_cycle();
+        MLE_SET_INFO(editor, "symbols %s", glyphs_name());
+    } else if (opt_tok(line, "basics")) {
+        MLE_SET_INFO(editor, "%s", "arrows, C-s save, C-o open, C-x quit, C-z undo, C-f find, C-k cut, C-u paste. f2 lists every binding");
+    } else if (opt_tok(line, "copy")) {
+        if (bv && bv->active_cursor) {
+            if (bv->active_cursor->is_anchored) cursor_copy_anchor(bv->active_cursor, 1);
+            else cursor_cut_copy(bv->active_cursor, 0, 1, 0);
+        }
+        MLE_SET_INFO(editor, "%s", "copied selection");
+    } else if (opt_tok(line, "paste")) {
+        if (bv && bv->active_cursor) cursor_paste_clipboard(bv->active_cursor);
+        MLE_SET_INFO(editor, "%s", "pasted clipboard");
+    } else if (opt_tok(line, "rebind")) {
+        char *cmdn = NULL;
+        char *param = NULL;
+        kinput_t input;
+        char key[MLE_MAX_KEYNAME_LEN + 1];
+        editor_prompt(editor, "rebind: command? (cmd_save, cmd_iterm, ...)", NULL, &cmdn);
+        if (!cmdn || !cmdn[0]) {
+            free(cmdn);
+            return MLE_OK;
+        }
+        editor_prompt(editor, "rebind: parameter? (empty for none)", NULL, &param);
+        MLE_SET_INFO(editor, "%s", "rebind: press a key, esc cancels");
+        editor_display(editor);
+        memset(&input, 0, sizeof(input));
+        _cmd_get_input(ctx, &input);
+        if (input.key == TB_KEY_ESC || input.key == TB_KEY_CTRL_C) {
+            MLE_SET_INFO(editor, "%s", "rebind cancelled");
+            free(cmdn);
+            free(param);
+            opt_refresh(ctx);
+            return MLE_OK;
+        }
+        memset(key, 0, sizeof(key));
+        if (editor_input_to_key(&input, key) != MLE_OK) {
+            MLE_SET_ERR(editor, "%s", "rebind: unrecognized key");
+            free(cmdn);
+            free(param);
+            opt_refresh(ctx);
+            return MLE_ERR;
+        }
+        if (editor_bind(editor, "mle_normal", cmdn, key, (param && param[0]) ? param : NULL) != MLE_OK) {
+            MLE_SET_ERR(editor, "rebind: no command %s", cmdn);
+            free(cmdn);
+            free(param);
+            opt_refresh(ctx);
+            return MLE_ERR;
+        }
+        MLE_SET_INFO(editor, "rebind: %s runs %s", key, cmdn);
+        free(cmdn);
+        free(param);
+    } else {
+        MLE_SET_INFO(editor, "%s", "settings: nothing on this row");
+        return MLE_OK;
+    }
+    opt_refresh(ctx);
+    return MLE_OK;
+}
+
+static void opt_refresh(cmd_context_t *ctx) {
+    str_t menu = {0};
+    bint_t line;
+    bview_t *mv;
+    mv = ctx->bview;
+    if (!mv || !mv->buffer || !mv->active_cursor) return;
+    line = mv->active_cursor->mark->bline->line_index;
+    opt_build(ctx->editor, &menu);
+    buffer_set(mv->buffer, menu.data ? menu.data : "", (bint_t)menu.len);
+    mv->buffer->is_unsaved = 0;
+    if (mv->buffer->line_count < 1) {
+        str_free(&menu);
+        return;
+    }
+    if (line >= mv->buffer->line_count) line = mv->buffer->line_count - 1;
+    if (line < 0) line = 0;
+    mark_move_to(mv->active_cursor->mark, line, 0);
+    bview_rectify_viewport(mv);
+    str_free(&menu);
+}
+
+int cmd_options(cmd_context_t *ctx) {
+    str_t menu = {0};
+    bview_t *opened;
+    if (ctx->editor->headless_mode) return MLE_OK;
+    if (iterm_visible(ctx->editor)) iterm_action(ctx->editor, "unfocus");
+    g_opt_bview = ctx->editor->active_edit;
+    if (g_opt_bview && g_opt_bview->is_menu) g_opt_bview = ctx->editor->active_edit_last;
+    opt_build(ctx->editor, &menu);
+    editor_menu(ctx->editor, _cmd_menu_options_cb, menu.data, (int)menu.len, NULL, &opened);
+    if (opened) {
+        if (ctx->editor->kmap_options) bview_push_kmap(opened, ctx->editor->kmap_options);
+        mark_move_to(opened->active_cursor->mark, 1, 0);
+    }
+    str_free(&menu);
+    return MLE_OK;
+}
+
+int cmd_paste_sys(cmd_context_t *ctx) {
+    MLE_FOREACH_CURSOR(ctx->cursor) {
+        cursor_paste_clipboard(cursor);
+    }
+    return MLE_OK;
+}
+
 // Shell
 int cmd_shell(cmd_context_t *ctx) {
     char *cmd;
@@ -1247,9 +1600,14 @@ int cmd_perl(cmd_context_t *ctx) {
     // Shell escape code
     code_escaped = util_escape_shell_arg(code, strlen(code));
     free(code);
+    if (!code_escaped) return MLE_ERR;
 
     // Format cmd
-    asprintf(&cmd, "perl -lp -E 'BEGIN{$i=0}' -E %s 2>/dev/null", code_escaped);
+    cmd = NULL;
+    if (asprintf(&cmd, "perl -lp -E 'BEGIN{$i=0}' -E %s 2>/dev/null", code_escaped) < 0 || !cmd) {
+        free(code_escaped);
+        return MLE_ERR;
+    }
     free(code_escaped);
 
     // Apply perl cmd
@@ -1415,7 +1773,11 @@ int cmd_less(cmd_context_t *ctx) {
             "LESSEDIT=echo %%lt >%s; kill 0\" | lesskey -o $tmp_lesskey -- -;"
             "less +%ld -j%ld -k $tmp_lesskey -S %s;"
             "rm -f $tmp_lesskey";
-        asprintf(&sh, sh_fmt, tmp_linenum, ctx->cursor->mark->bline->line_index+1, screen_y+1, tmp_buf);
+        sh = NULL;
+        if (asprintf(&sh, sh_fmt, tmp_linenum, ctx->cursor->mark->bline->line_index+1, screen_y+1, tmp_buf) < 0 || !sh) {
+            rc = MLE_ERR;
+            break;
+        }
         tb_shutdown();
         if (MLE_ERR == util_shell_exec(ctx->editor, sh, -1, NULL, 0, 1, "bash", NULL, NULL, NULL)) {
             rc = MLE_ERR;
@@ -1459,11 +1821,37 @@ int cmd_show_help(cmd_context_t *ctx) {
     str_append(&h,
         "# mle command help\n\n"
         "    notes\n"
+        "        Everyday keys, also on by themselves: arrows, Home, End,\n"
+        "        PgUp, PgDn, Shift-arrows, Backspace, Delete, Ctrl-S save,\n"
+        "        Ctrl-O open, Ctrl-X quit, Ctrl-Z undo, Ctrl-Y redo,\n"
+        "        Ctrl-F find, Ctrl-G next, Ctrl-K cut, Ctrl-U paste,\n"
+        "        Shift-Insert paste, F1 guide, F2 this list, F7 terminal,\n"
+        "        F8 settings, F9 files, F10 git.\n"
+        "        Every other binding still works. This page lists them.\n"
         "        C- means Ctrl\n"
         "        M- means Alt\n"
         "        S- means Shift\n"
         "        cmd_x=(default) means unmatched input is handled by cmd_x\n"
-        "        (allow_fallthru)=yes means unmatched input is handled by the parent kmap\n\n"
+        "        (allow_fallthru)=yes means unmatched input is handled by the parent kmap\n"
+        "        Drag the bar between the editor and the terminal to resize it.\n"
+        "        + on the tab row opens a shell. x on a tab closes that shell.\n"
+        "        While a terminal is focused, keys go to the shell.\n"
+        "        f7 or M-` hides it. Ctrl-Shift-` does too when the host\n"
+        "        terminal sends that chord. M-t is the command prefix.\n"
+        "        S-arrows select terminal text. S-pgup scrolls. C-pgup switches tabs.\n"
+        "        f8 opens settings and stays open. Escape or the close row leaves.\n"
+        "        Themes: mle, paper, night, forest, ember, ocean, plus your own.\n"
+        "        newtheme copies one. painttheme sets a color. They save to ~/.mle/themes.\n"
+        "        f1 is a short guide. f9 is the file list. f10 is git.\n"
+        "        In git, type the commit on its line. Commit, Push, and Pull\n"
+        "        are buttons. Click a file for a diff that names each line.\n"
+        "        Push and discard still ask you to type yes. Pull does not.\n"
+        "        f8 symbols cycles plain, marks, slab, and line. The last two\n"
+        "        are bitmap fonts compiled into mle and drawn as braille.\n"
+        "        Press / in the file list to type a folder path.\n"
+        "        Drag selects letters under the pointer. Double-click selects a word.\n"
+        "        Triple-click selects a line. The status bar is clickable.\n"
+        "        S-insert pastes the system clipboard. Mouse drag copies on release.\n\n"
     );
 
     // Build current kmap stack
@@ -1802,10 +2190,13 @@ static int _cmd_find_word_ex(cmd_context_t *ctx, int is_prev) {
     MLE_FOREACH_CURSOR(ctx->cursor) {
         if (cursor_select_by(cursor, "word", 0) == MLE_OK) {
             mark_swap(cursor->mark, cursor->anchor);
+            word = NULL;
             mark_get_between(cursor->mark, cursor->anchor, &word, &word_len);
-            re_len = asprintf(&re, "\\b%s\\b", word);
+            re = NULL;
+            re_len = word ? asprintf(&re, "\\b%s\\b", word) : -1;
             free(word);
             cursor_toggle_anchor(cursor, 0);
+            if (re_len < 0 || !re) continue;
             if (move_next_prev_re_nudge(cursor->mark, re, re_len) == MLBUF_ERR) {
                 move_beginning_end(cursor->mark);
                 move_next_prev_re(cursor->mark, re, re_len);
@@ -1928,10 +2319,16 @@ static int _cmd_menu_ctag_cb(cmd_context_t *ctx) {
     re_len -= 2;
     re_len -= 4;
     re[re_len] = '\0'; // Trunc trailing `$/;"`
+    qre = NULL;
     util_pcre_replace("([\\.\\\\\\+\\*\\?\\^\\$\\[\\]\\(\\)\\{\\}\\=\\!\\>\\<\\|\\:\\-])", re, "\\\\$1", &qre, &qre_len);
     editor_close_bview(ctx->editor, ctx->bview, NULL);
     editor_open_bview(ctx->editor, NULL, MLE_BVIEW_TYPE_EDIT, fname, strlen(fname), 1, 0, 0, NULL, &bview);
-    asprintf(&qre2, "^%s", qre);
+    qre2 = NULL;
+    if (!qre || asprintf(&qre2, "^%s", qre) < 0 || !qre2) {
+        free(line);
+        free(qre);
+        return MLE_OK;
+    }
     mark_move_next_re(bview->active_cursor->mark, qre2, qre_len+1);
     bview_center_viewport_y(bview);
     free(line);
@@ -2062,9 +2459,11 @@ static void _cmd_insert_auto_indent_newline(cmd_context_t *ctx) {
             && indent_len % ctx->bview->tab_width == 0
             && util_pcre_match("^ *$", indent, indent_len, NULL, NULL)
         ) {
-            asprintf(&tmp, "%*c", (int)ctx->bview->tab_width, ' ');
-            mark_insert_before(ctx->cursor->mark, tmp, strlen(tmp));
-            free(tmp);
+            tmp = NULL;
+            if (asprintf(&tmp, "%*c", (int)ctx->bview->tab_width, ' ') >= 0 && tmp) {
+                mark_insert_before(ctx->cursor->mark, tmp, strlen(tmp));
+                free(tmp);
+            }
         } else if (!ctx->bview->tab_to_space
             && util_pcre_match("^\\t*$", indent, indent_len, NULL, NULL)
         ) {

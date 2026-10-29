@@ -39,7 +39,10 @@ int cursor_toggle_anchor(cursor_t *cursor, int use_srules) {
     if (!cursor->is_anchored && !cursor->is_temp_anchored) {
         mark_clone(cursor->mark, &(cursor->anchor));
         if (use_srules) {
-            cursor->sel_rule = srule_new_range(cursor->mark, cursor->anchor, 0, TB_REVERSE);
+            uint16_t sfg = TB_BLACK;
+            uint16_t sbg = TB_CYAN;
+            if (cursor->bview && cursor->bview->editor) theme_selection(cursor->bview->editor, &sfg, &sbg);
+            cursor->sel_rule = srule_new_range(cursor->mark, cursor->anchor, sfg, sbg);
             buffer_add_srule(cursor->bview->buffer, cursor->sel_rule);
         }
         cursor->is_anchored = 1;
@@ -60,6 +63,15 @@ int cursor_toggle_anchor(cursor_t *cursor, int use_srules) {
 int cursor_drop_anchor(cursor_t *cursor, int use_srules) {
     if (cursor->is_anchored) return MLE_OK;
     return cursor_toggle_anchor(cursor, use_srules);
+}
+
+/* Delete a non-empty selection and drop the anchor. Returns 1 if it ate one. */
+int cursor_eat_selection(cursor_t *cursor) {
+    if (!cursor || !cursor->is_anchored || !cursor->is_temp_anchored || cursor->is_block) return 0;
+    if (mark_is_eq(cursor->mark, cursor->anchor)) return 0;
+    mark_delete_between(cursor->mark, cursor->anchor);
+    cursor_lift_anchor(cursor);
+    return 1;
 }
 
 // Lift cursor anchor
@@ -237,21 +249,38 @@ int cursor_cut_copy(cursor_t *cursor, int is_cut, int use_srules, int append) {
         mark_move_eol(cursor->anchor);
         if (!cursor->is_block) mark_move_by(cursor->anchor, 1);
     }
+    cutbuf = NULL;
+    cutbuf_len = 0;
     if (cursor->is_block) {
         mark_block_get_between(cursor->mark, cursor->anchor, &cutbuf, &cutbuf_len);
     } else {
         mark_get_between(cursor->mark, cursor->anchor, &cutbuf, &cutbuf_len);
     }
+    if (!cutbuf) {
+        cursor_toggle_anchor(cursor, use_srules);
+        return MLE_ERR;
+    }
     if (append && cursor->cut_buffer) {
+        char *grown;
         cur_len = strlen(cursor->cut_buffer);
-        cursor->cut_buffer = realloc(cursor->cut_buffer, cur_len + cutbuf_len + 1);
-        strncat(cursor->cut_buffer, cutbuf, cutbuf_len);
+        grown = realloc(cursor->cut_buffer, (size_t)cur_len + (size_t)cutbuf_len + 1);
+        if (!grown) {
+            free(cutbuf);
+            cursor_toggle_anchor(cursor, use_srules);
+            return MLE_ERR;
+        }
+        cursor->cut_buffer = grown;
+        memcpy(cursor->cut_buffer + cur_len, cutbuf, (size_t)cutbuf_len);
+        cursor->cut_buffer[cur_len + cutbuf_len] = '\0';
         free(cutbuf);
     } else {
         cursor->cut_buffer = cutbuf;
     }
     if (cursor->bview->editor->cut_buffer) free(cursor->bview->editor->cut_buffer);
     cursor->bview->editor->cut_buffer = strdup(cursor->cut_buffer);
+    if (tb_width() >= 0 && cursor->cut_buffer) {
+        util_clipboard_set(cursor->cut_buffer, strlen(cursor->cut_buffer));
+    }
     if (is_cut) {
         if (cursor->is_block) {
             mark_block_delete_between(cursor->mark, cursor->anchor);
@@ -261,6 +290,47 @@ int cursor_cut_copy(cursor_t *cursor, int is_cut, int use_srules, int append) {
     }
     cursor_toggle_anchor(cursor, use_srules);
     return MLE_OK;
+}
+
+// Copy the current anchor selection into the cut buffers. The anchor stays.
+int cursor_copy_anchor(cursor_t *cursor, int to_clipboard) {
+    char *cutbuf;
+    bint_t cutbuf_len;
+    editor_t *editor;
+    if (!cursor || !cursor->is_anchored || mark_is_eq(cursor->mark, cursor->anchor)) return MLE_ERR;
+    if (cursor->is_block) {
+        mark_block_get_between(cursor->mark, cursor->anchor, &cutbuf, &cutbuf_len);
+    } else {
+        mark_get_between(cursor->mark, cursor->anchor, &cutbuf, &cutbuf_len);
+    }
+    if (!cutbuf) return MLE_ERR;
+    if (cursor->cut_buffer) free(cursor->cut_buffer);
+    cursor->cut_buffer = cutbuf;
+    editor = cursor->bview->editor;
+    if (editor->cut_buffer) free(editor->cut_buffer);
+    editor->cut_buffer = strdup(cutbuf);
+    if (to_clipboard && tb_width() >= 0) util_clipboard_set(cutbuf, strlen(cutbuf));
+    return MLE_OK;
+}
+
+// Paste the system clipboard, or the editor cut buffer when it is unavailable.
+int cursor_paste_clipboard(cursor_t *cursor) {
+    char *clip;
+    size_t n;
+    editor_t *editor;
+    if (!cursor || !cursor->bview) return MLE_ERR;
+    editor = cursor->bview->editor;
+    clip = NULL;
+    n = 0;
+    if (tb_width() >= 0 && util_clipboard_get(&clip, &n) == MLE_OK && clip && clip[0]) {
+        if (editor->cut_buffer) free(editor->cut_buffer);
+        editor->cut_buffer = clip;
+        if (cursor->cut_buffer) free(cursor->cut_buffer);
+        cursor->cut_buffer = strdup(clip);
+    } else if (clip) {
+        free(clip);
+    }
+    return cursor_uncut(cursor);
 }
 
 // Uncut from cursor cut_buffer

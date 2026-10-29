@@ -374,7 +374,7 @@ int mark_get_between(mark_t *self, mark_t *other, char **ret_str, bint_t *ret_st
     if (mark_cmp(self, other, &a, &b) == 0) {
         *ret_str = strdup("");
         *ret_str_len = 0;
-        return MLBUF_OK;
+        return *ret_str ? MLBUF_OK : MLBUF_ERR;
     }
     return buffer_substr(
         a->bline->buffer,

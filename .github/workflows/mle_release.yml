@@ -3,19 +3,20 @@ name: mle_release
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
-  mle_release_job:
-
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest,    cc: musl-gcc, extra: 'mle_static=1' }
-          - { runner: ubuntu-24.04-arm, cc: musl-gcc, extra: 'mle_static=1' }
-          - { runner: macos-latest,     cc: cc,       extra: ''             }
-          - { runner: ubuntu-latest,    cc: cosmocc,  extra: 'AR=cosmoar'   }
-
-    runs-on: ${{ matrix.runner }}
+          - { runner: ubuntu-latest,    cc: musl-gcc, extra: 'mle_static=1', label: linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, cc: musl-gcc, extra: 'mle_static=1', label: linux-aarch64 }
+          - { runner: macos-latest,     cc: cc,       extra: '',             label: macos }
+          - { runner: ubuntu-latest,    cc: cosmocc,  extra: 'AR=cosmoar',   label: cosmo }
 
     steps:
       - name: checkout
@@ -36,19 +37,38 @@ jobs:
           echo "$HOME/cosmocc/bin" >>"$GITHUB_PATH"
 
       - name: build
-        run: make mle_vendor=1 CC=${{ matrix.cc }} ${{ matrix.extra }} && ./mle -v
+        run: make release mle_vendor=1 CC=${{ matrix.cc }} ${{ matrix.extra }} mle_dist_tag=${{ matrix.label }}
 
-      - name: name_binary
-        id: name
+      - name: upload_binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            dist/mle-code_*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: always() && github.event_name == 'release' && needs.build.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: download
+        uses: actions/download-artifact@v4
+        with:
+          path: incoming
+
+      - name: collect
         run: |
-          vers=$(./mle -v | awk '{print $NF}')
-          os_arch="$(uname -s | tr A-Z a-z)_$(uname -m)"
-          test ${{ matrix.cc }} != cosmocc || os_arch=cosmo
-          name="mle_${vers}_${os_arch}"
-          mv -v mle "$name"
-          echo "name=$name" >>"$GITHUB_OUTPUT"
+          mkdir -p dist
+          find incoming -type f -name 'mle-code_*' -exec cp -v {} dist/ \;
+          test -n "$(find dist -name 'mle-code_*' -print -quit)"
+          (cd dist && sha256sum mle-code_* > SHA256SUMS)
+          ls -l dist
 
       - name: upload_release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.name.outputs.name }}
+          files: |
+            dist/mle-code_*
+            dist/SHA256SUMS

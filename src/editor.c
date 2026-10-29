@@ -1,5 +1,8 @@
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
+#include <poll.h>
+#include <time.h>
 #include <uthash.h>
 #include <utlist.h>
 #include <inttypes.h>
@@ -42,6 +45,7 @@ static void _editor_resize(editor_t *editor, int w, int h);
 static void _editor_maybe_lift_temp_anchors(cmd_context_t *ctx);
 static void _editor_draw_cursors(editor_t *editor, bview_t *bview);
 static void _editor_get_user_input(editor_t *editor, cmd_context_t *ctx);
+static int _editor_wait_background(editor_t *editor);
 static void _editor_ingest_paste(editor_t *editor, cmd_context_t *ctx);
 static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev);
 static void _editor_append_pastebuf(editor_t *editor, cmd_context_t *ctx, kinput_t *input);
@@ -105,6 +109,10 @@ int editor_init(editor_t *editor, int argc, char **argv) {
         editor->read_rc_file = MLE_DEFAULT_READ_RC_FILE;
         editor->soft_wrap = MLE_DEFAULT_SOFT_WRAP;
         editor->coarse_undo = MLE_DEFAULT_COARSE_UNDO;
+        editor->mouse_support = MLE_DEFAULT_MOUSE_SUPPORT;
+        editor->mouse_copy = 1;
+        editor->hl_line = 0;
+        theme_init(editor);
         editor->viewport_scope_x = -4;
         editor->viewport_scope_y = -1;
         editor->color_col = -1;
@@ -128,12 +136,13 @@ int editor_init(editor_t *editor, int argc, char **argv) {
         if (!_editor_should_skip_rc(argc, argv)) {
             home_rc = NULL;
             if (getenv("HOME")) {
-                asprintf(&home_rc, "%s/%s", getenv("HOME"), ".mlerc");
-                if (util_is_file(home_rc, "rb", &rc)) {
-                    rv = _editor_init_from_rc(editor, rc, home_rc);
-                    fclose(rc);
+                if (asprintf(&home_rc, "%s/%s", getenv("HOME"), ".mlerc") >= 0 && home_rc) {
+                    if (util_is_file(home_rc, "rb", &rc)) {
+                        rv = _editor_init_from_rc(editor, rc, home_rc);
+                        fclose(rc);
+                    }
+                    free(home_rc);
                 }
-                free(home_rc);
             }
             if (rv != MLE_OK) break;
             if (util_is_file("/etc/mlerc", "rb", &rc)) {
@@ -152,6 +161,8 @@ int editor_init(editor_t *editor, int argc, char **argv) {
 
         // Init bviews
         _editor_init_bviews(editor, argc, argv);
+
+        side_init(editor);
 
         // Init startup macro
         _editor_init_headless_mode(editor);
@@ -189,6 +200,8 @@ int editor_run(editor_t *editor) {
 // Deinit editor
 int editor_deinit(editor_t *editor) {
     bview_t *bview;
+    iterm_shutdown(editor);
+    side_shutdown(editor);
     bview_t *bview_tmp1;
     bview_t *bview_tmp2;
     kmap_t *kmap;
@@ -251,6 +264,7 @@ int editor_deinit(editor_t *editor) {
     if (editor->ttyfd) close(editor->ttyfd);
     if (editor->startup_macro_name) free(editor->startup_macro_name);
     if (editor->macro_last) free(editor->macro_last);
+    while (editor->aprocs) aproc_destroy(editor->aprocs, 1);
 
     pcre2_match_data_free(pcre2_md);
 
@@ -282,6 +296,13 @@ int editor_prompt(editor_t *editor, char *prompt, editor_prompt_params_t *params
     editor_open_bview(editor, NULL, MLE_BVIEW_TYPE_PROMPT, NULL, 0, 1, 0, 0, NULL, &editor->prompt);
     if (params && params->prompt_cb) bview_add_listener(editor->prompt, params->prompt_cb, params->prompt_cb_udata);
     editor->prompt->prompt_str = prompt;
+    /* Everyday keys live on kmap_basic, which falls through. Under a prompt
+       those keys open another prompt, and nested prompts are refused, so the
+       line looks dead. Drop that map on the prompt only. */
+    if (editor->prompt->kmap_tail && editor->kmap_basic
+        && editor->prompt->kmap_tail->kmap == editor->kmap_basic) {
+        bview_pop_kmap(editor->prompt, NULL);
+    }
     bview_push_kmap(editor->prompt, params && params->kmap ? params->kmap : editor->kmap_prompt_input);
 
     // Insert data if present
@@ -588,6 +609,9 @@ int editor_display(editor_t *editor) {
     DL_FOREACH2(editor->top_bviews, bview, top_next) {
         _editor_draw_cursors(editor, bview);
     }
+    if (editor->side) side_draw(editor);
+    if (editor->iterm) iterm_draw(editor);
+    if (!editor->prompt && editor->side) side_place_cursor(editor);
     if (editor->debug_display_keys) _editor_display_keys(editor);
     tb_present();
     return MLE_OK;
@@ -693,11 +717,16 @@ static int _editor_prompt_input_complete(cmd_context_t *ctx) {
     }
 
      // Assemble compgen command
+    cmd = NULL;
     cmd_arg = util_escape_shell_arg(
         loop_ctx->tab_complete_term,
         strlen(loop_ctx->tab_complete_term)
     );
-    asprintf(&cmd, "compgen -f %s 2>/dev/null | sort", cmd_arg);
+    if (!cmd_arg) return MLE_OK;
+    if (asprintf(&cmd, "compgen -f %s 2>/dev/null | sort", cmd_arg) < 0 || !cmd) {
+        free(cmd_arg);
+        return MLE_OK;
+    }
 
     // Run compgen command
     terms = NULL;
@@ -705,9 +734,9 @@ static int _editor_prompt_input_complete(cmd_context_t *ctx) {
     util_shell_exec(ctx->editor, cmd, 1, NULL, 0, 0, "bash", &terms, &terms_len, NULL);
     free(cmd);
     free(cmd_arg);
+    if (!terms) return MLE_OK;
 
     // Get number of terms
-    // TODO valgrind thinks there's an error here
     num_terms = 0;
     term = strchr(terms, '\n');
     while (term) {
@@ -923,7 +952,7 @@ static void _editor_loop(editor_t *editor, loop_context_t *loop_ctx) {
 
         // Check for async io
         // aproc_drain_all will bail and return 0 if there's any tty data
-        if (editor->aprocs && aproc_drain_all(editor->aprocs, &editor->ttyfd)) {
+        if (editor->aprocs && !iterm_running(editor) && aproc_drain_all(editor->aprocs, &editor->ttyfd)) {
             continue;
         }
 
@@ -1039,7 +1068,8 @@ static void _editor_refresh_cmd_context(editor_t *editor, cmd_context_t *cmd_ctx
 static void _editor_notify_cmd_observers(cmd_context_t *ctx, int is_before) {
     char *event_name;
     if (!ctx->editor->observers) return;
-    asprintf(&event_name, "cmd:%s:%s", ctx->cmd->name, is_before ? "before" : "after");
+    event_name = NULL;
+    if (asprintf(&event_name, "cmd:%s:%s", ctx->cmd->name, is_before ? "before" : "after") < 0 || !event_name) return;
     _editor_refresh_cmd_context(ctx->editor, ctx);
     editor_notify_observers(ctx->editor, event_name, (void*)ctx);
     free(event_name);
@@ -1093,6 +1123,31 @@ int editor_input_to_key(kinput_t *input, char *keyname) {
     return _editor_event_to_key(&ev, keyname);
 }
 
+// Bind cmd_name to key_patt in a kmap. kmap_name NULL uses mle_normal.
+int editor_bind(editor_t *editor, char *kmap_name, char *cmd_name, char *key_patt, char *static_param) {
+    kmap_t *kmap;
+    cmd_t *cmd;
+    char *cur;
+    int rc;
+    if (!editor || !cmd_name || !key_patt || !key_patt[0]) return MLE_ERR;
+    kmap = NULL;
+    cmd = NULL;
+    if (!kmap_name || !kmap_name[0]) kmap = editor->kmap_normal;
+    else HASH_FIND_STR(editor->kmap_map, kmap_name, kmap);
+    if (!kmap) return MLE_ERR;
+    HASH_FIND_STR(editor->cmd_map, cmd_name, cmd);
+    if (!cmd) return MLE_ERR;
+    cur = strdup(key_patt);
+    if (!cur) return MLE_ERR;
+    rc = _editor_init_kmap_add_binding_to_trie(&kmap->bindings->children, cmd_name, cur, key_patt, static_param);
+    free(cur);
+    return rc;
+}
+
+void editor_add_syntax(editor_t *editor, char *name, char *path_pattern, srule_def_t *defs) {
+    _editor_init_syntax(editor, NULL, name, path_pattern, -1, -1, defs);
+}
+
 // If input == editor->macro_toggle_key, toggle macro mode and return 1. Else
 // return 0.
 static int _editor_maybe_toggle_macro(editor_t *editor, kinput_t *input) {
@@ -1143,6 +1198,9 @@ static void _editor_resize(editor_t *editor, int w, int h) {
     editor->rect_prompt.w = editor->w;
     editor->rect_prompt.h = 1;
 
+    if (editor->side) side_apply_layout(editor, &editor->rect_edit);
+    if (editor->iterm) iterm_apply_layout(editor, &editor->rect_edit);
+
     DL_FOREACH2(editor->top_bviews, bview, top_next) {
         if (MLE_BVIEW_IS_PROMPT(bview)) {
             bounds = &editor->rect_prompt;
@@ -1154,6 +1212,12 @@ static void _editor_resize(editor_t *editor, int w, int h) {
         }
         bview_resize(bview, bounds->x, bounds->y, bounds->w, bounds->h);
     }
+}
+
+int editor_relayout(editor_t *editor) {
+    if (!editor || editor->headless_mode) return MLE_OK;
+    _editor_resize(editor, -1, -1);
+    return MLE_OK;
 }
 
 // Lift temporary anchors on cursor if not running cmd_move_temp_anchor
@@ -1225,6 +1289,94 @@ static void _editor_remember_keys(editor_t *editor, kinput_t *input) {
     memcpy(buf, key, MLE_MAX_KEYNAME_LEN);
 }
 
+/* Wait on the tty, resize pipe, terminal PTYs, and async procs together.
+ * Return 1 when the caller should redraw and wait again. Return 0 when a
+ * user event is ready to read with tb_peek_event. */
+static int _editor_wait_background(editor_t *editor) {
+    enum { MAX_PTY = 64, MAX_APROC = 64 };
+    int ttyfd;
+    int resizefd;
+    int ptyfds[MAX_PTY];
+    aproc_t *asnap[MAX_APROC];
+    struct pollfd pfds[2 + MAX_PTY + MAX_APROC];
+    int npty;
+    int nas;
+    int np;
+    int i;
+    int rc;
+    int progress;
+    aproc_t *aproc;
+
+    ttyfd = -1;
+    resizefd = -1;
+    if (tb_get_fds(&ttyfd, &resizefd) != TB_OK) return 0;
+
+    npty = iterm_pty_fds(editor, ptyfds, MAX_PTY);
+    nas = 0;
+    DL_FOREACH(editor->aprocs, aproc) {
+        if (nas >= MAX_APROC) break;
+        if (aproc->rfd < 0) continue;
+        asnap[nas++] = aproc;
+    }
+
+    np = 0;
+    pfds[np].fd = ttyfd;
+    pfds[np].events = POLLIN;
+    pfds[np].revents = 0;
+    np += 1;
+    pfds[np].fd = resizefd;
+    pfds[np].events = POLLIN;
+    pfds[np].revents = 0;
+    np += 1;
+    for (i = 0; i < npty; i++) {
+        pfds[np].fd = ptyfds[i];
+        pfds[np].events = POLLIN;
+        pfds[np].revents = 0;
+        np += 1;
+    }
+    for (i = 0; i < nas; i++) {
+        pfds[np].fd = asnap[i]->rfd;
+        pfds[np].events = POLLIN;
+        pfds[np].revents = 0;
+        np += 1;
+    }
+
+    rc = poll(pfds, (nfds_t)np, -1);
+    if (rc < 0) {
+        if (errno == EINTR) return 1;
+        return 0;
+    }
+
+    progress = 0;
+    for (i = 0; i < npty; i++) {
+        short rev;
+        rev = pfds[2 + i].revents;
+        if (rev & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+            iterm_drain_fd(editor, ptyfds[i]);
+            progress = 1;
+        }
+    }
+    for (i = 0; i < nas; i++) {
+        short rev;
+        aproc_t *cur;
+        int live;
+        rev = pfds[2 + npty + i].revents;
+        if (!(rev & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) continue;
+        live = 0;
+        DL_FOREACH(editor->aprocs, cur) {
+            if (cur == asnap[i]) {
+                live = 1;
+                break;
+            }
+        }
+        if (live && aproc_read_ready(asnap[i])) progress = 1;
+    }
+
+    if (pfds[0].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) return 0;
+    if (pfds[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) return 0;
+    return progress ? 1 : 0;
+}
+
 // Get user input
 static void _editor_get_user_input(editor_t *editor, cmd_context_t *ctx) {
     int rc;
@@ -1237,9 +1389,20 @@ static void _editor_get_user_input(editor_t *editor, cmd_context_t *ctx) {
         return;
     }
 
-    // Poll for event
+    // Poll for event. A live terminal shares this wait with its PTY.
     while (1) {
-        rc = tb_poll_event(&ev);
+        if (iterm_running(editor)) {
+            rc = tb_peek_event(&ev, 0);
+            if (rc != TB_OK) {
+                if (_editor_wait_background(editor)) {
+                    if (!editor->is_display_disabled) editor_display(editor);
+                    continue;
+                }
+                rc = tb_peek_event(&ev, 0);
+            }
+        } else {
+            rc = tb_poll_event(&ev);
+        }
         if (rc != TB_OK) {
             continue; // Error
         } else if (ev.type == TB_EVENT_RESIZE) {
@@ -1248,9 +1411,27 @@ static void _editor_get_user_input(editor_t *editor, cmd_context_t *ctx) {
             editor_display(editor);
             continue;
         } else if (ev.type == TB_EVENT_MOUSE) {
-            // Mouse cursor
+            if (iterm_dragging(editor) && iterm_handle_mouse(editor, &ev)) {
+                editor_display(editor);
+                continue;
+            }
+            if (side_handle_mouse(editor, &ev)) {
+                editor_display(editor);
+                continue;
+            }
+            if (iterm_handle_mouse(editor, &ev)) {
+                editor_display(editor);
+                continue;
+            }
             _editor_handle_mouse(editor, &ev);
             editor_display(editor);
+            continue;
+        } else if (!editor->prompt && side_handle_key(editor, &ev)) {
+            if (!editor->is_display_disabled) editor_display(editor);
+            continue;
+        } else if (!editor->prompt && iterm_handle_key(editor, &ev)) {
+            iterm_drain_pending(editor);
+            if (!editor->is_display_disabled) editor_display(editor);
             continue;
         }
         MLE_KINPUT_SET(ctx->input, ev.mod, ev.ch, ev.key);
@@ -1292,50 +1473,391 @@ static void _editor_ingest_paste(editor_t *editor, cmd_context_t *ctx) {
     }
 }
 
+static long _editor_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static bview_t *_editor_bview_at(bview_t *self, int x, int y) {
+    if (!self || !MLE_BVIEW_IS_EDIT(self)) return NULL;
+    if (self->split_child) {
+        bview_t *hit;
+        hit = _editor_bview_at(self->split_child, x, y);
+        if (hit) return hit;
+    }
+    if (x >= self->x && y >= self->y && x < self->x + self->w && y < self->y + self->h) return self;
+    return NULL;
+}
+
+static int _editor_line_at(bview_t *bview, int y, bline_t **ret) {
+    bint_t line_index;
+    if (!bview || !bview->viewport_mark) return 0;
+    if (y < bview->rect_buffer.y || y >= bview->rect_buffer.y + bview->rect_buffer.h) return 0;
+    line_index = bview->viewport_mark->bline->line_index + (y - bview->rect_buffer.y);
+    *ret = NULL;
+    buffer_get_bline_w_hint(bview->buffer, line_index, bview->viewport_mark->bline, ret);
+    return *ret ? 1 : 0;
+}
+
+static void _editor_menu_click(editor_t *editor, bview_t *menu) {
+    cmd_context_t ctx;
+    if (!menu || !menu->menu_callback || !editor->loop_ctx) return;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.editor = editor;
+    ctx.loop_ctx = editor->loop_ctx;
+    ctx.bview = menu;
+    ctx.cursor = menu->active_cursor;
+    ctx.buffer = menu->buffer;
+    menu->menu_callback(&ctx);
+}
+
+static void _editor_status_click(editor_t *editor, int x) {
+    cmd_context_t ctx;
+    bview_t *bv;
+    bv = editor->active_edit;
+    if (!bv || bv->is_menu) bv = editor->active_edit_last;
+    if (!bv || !editor->loop_ctx) return;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.editor = editor;
+    ctx.loop_ctx = editor->loop_ctx;
+    ctx.bview = bv;
+    ctx.cursor = bv->active_cursor;
+    ctx.buffer = bv->buffer;
+    if (editor->status_git_w > 0 && x >= editor->status_git_x && x < editor->status_git_x + editor->status_git_w) {
+        side_action(editor, "git");
+        return;
+    }
+    if (editor->status_file_w > 0 && x >= editor->status_file_x && x < editor->status_file_x + editor->status_file_w) {
+        cmd_blist(&ctx);
+        return;
+    }
+    if (editor->status_pos_w > 0 && x >= editor->status_pos_x && x < editor->status_pos_x + editor->status_pos_w) {
+        cmd_move_to_line(&ctx);
+    }
+}
+
+static int _editor_is_word_ch(uint32_t ch) {
+    if (ch == '_') return 1;
+    if (ch >= '0' && ch <= '9') return 1;
+    if (ch >= 'A' && ch <= 'Z') return 1;
+    if (ch >= 'a' && ch <= 'z') return 1;
+    return 0;
+}
+
+static void _editor_word_span(bline_t *bline, bint_t col, bint_t *lo, bint_t *hi) {
+    bint_t i;
+    MLBUF_BLINE_ENSURE_CHARS(bline);
+    if (!bline->char_count) {
+        *lo = 0;
+        *hi = 0;
+        return;
+    }
+    if (col < 0) col = 0;
+    if (col >= bline->char_count) col = bline->char_count - 1;
+    if (!_editor_is_word_ch(bline->chars[col].ch)) {
+        *lo = col;
+        *hi = col + 1;
+        return;
+    }
+    i = col;
+    while (i > 0 && _editor_is_word_ch(bline->chars[i - 1].ch)) i--;
+    *lo = i;
+    i = col + 1;
+    while (i < bline->char_count && _editor_is_word_ch(bline->chars[i].ch)) i++;
+    *hi = i;
+}
+
+static void _editor_select_range(cursor_t *cursor, bline_t *a, bint_t ac, bline_t *b, bint_t bc) {
+    int a_first;
+    if (cursor->is_anchored) cursor_lift_anchor(cursor);
+    a_first = a->line_index < b->line_index || (a->line_index == b->line_index && ac <= bc);
+    if (a_first) {
+        mark_move_to_w_bline(cursor->mark, a, ac);
+        cursor_drop_anchor(cursor, 1);
+        mark_move_to_w_bline(cursor->mark, b, bc);
+    } else {
+        mark_move_to_w_bline(cursor->mark, b, bc);
+        cursor_drop_anchor(cursor, 1);
+        mark_move_to_w_bline(cursor->mark, a, ac);
+    }
+    cursor->is_temp_anchored = 1;
+}
+
+static void _editor_select_words(cursor_t *cursor, bline_t *bline, bint_t col, int anchor_line, bint_t anchor_col) {
+    bline_t *aline;
+    bint_t olo, ohi, clo, chi;
+    aline = NULL;
+    buffer_get_bline(cursor->bview->buffer, anchor_line, &aline);
+    if (!aline) aline = bline;
+    _editor_word_span(aline, anchor_col, &olo, &ohi);
+    _editor_word_span(bline, col, &clo, &chi);
+    if (aline->line_index < bline->line_index || (aline->line_index == bline->line_index && olo <= clo)) {
+        _editor_select_range(cursor, aline, olo, bline, chi);
+    } else {
+        _editor_select_range(cursor, bline, clo, aline, ohi);
+    }
+}
+
+static void _editor_select_span(cursor_t *cursor, bline_t *bline, bint_t col, int anchor_line, bint_t anchor_col) {
+    bline_t *aline;
+    bint_t dest;
+    int forward;
+    aline = NULL;
+    buffer_get_bline(cursor->bview->buffer, anchor_line, &aline);
+    if (!aline) aline = bline;
+    forward = bline->line_index > aline->line_index
+        || (bline->line_index == aline->line_index && col >= anchor_col);
+    if (!cursor->anchor) return;
+    if (forward) {
+        mark_move_to_w_bline(cursor->anchor, aline, anchor_col);
+        dest = col < bline->char_count ? col + 1 : col;
+        mark_move_to_w_bline(cursor->mark, bline, dest);
+    } else {
+        dest = anchor_col < aline->char_count ? anchor_col + 1 : anchor_col;
+        mark_move_to_w_bline(cursor->anchor, aline, dest);
+        mark_move_to_w_bline(cursor->mark, bline, col);
+    }
+}
+
+static void _editor_select_lines(cursor_t *cursor, bline_t *from, bline_t *to) {
+    bline_t *lo;
+    bline_t *hi;
+    if (!from || !to) return;
+    if (from->line_index <= to->line_index) {
+        lo = from;
+        hi = to;
+    } else {
+        lo = to;
+        hi = from;
+    }
+    if (cursor->is_anchored) cursor_lift_anchor(cursor);
+    mark_move_to_w_bline(cursor->mark, lo, 0);
+    cursor_drop_anchor(cursor, 1);
+    cursor->is_temp_anchored = 1;
+    mark_move_eol(cursor->mark);
+    if (hi->next) mark_move_to_w_bline(cursor->mark, hi->next, 0);
+    else mark_move_eol(cursor->mark);
+}
+
+static void _editor_select_word_at(cursor_t *cursor, bline_t *bline, bint_t col) {
+    if (cursor->is_anchored) cursor_lift_anchor(cursor);
+    if (col >= bline->char_count && col > 0) col -= 1;
+    mark_move_to_w_bline(cursor->mark, bline, col);
+    if (cursor_select_by_word(cursor, 1) != MLE_OK) {
+        if (col < bline->char_count) {
+            cursor_drop_anchor(cursor, 1);
+            mark_move_to_w_bline(cursor->mark, bline, col + 1);
+        }
+    }
+    cursor->is_temp_anchored = 1;
+}
+
+static int m_btn;
+static int m_moved;
+static int m_clicks;
+static long m_last_ms;
+static int m_last_x;
+static int m_last_y;
+static int m_anchor_line;
+static bint_t m_anchor_col;
+static int m_gutter;
+static bview_t *m_bview;
+
 static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
-    bline_t *bline;
-    bint_t col;
     bview_t *bview;
     bview_t *root;
     cursor_t *cursor;
-    mark_t *mark;
-    int drop_anchor;
+    bline_t *bline;
+    bint_t col;
+    int extend;
+    int in_text;
+    int in_gutter;
+    long now;
 
-    root = bview_get_split_root(editor->active);
-    if (bview_screen_to_bline_col(root, ev->x, ev->y, &bview, &bline, &col) != MLE_OK) {
+    if (ev->y == editor->rect_status.y && ev->key == TB_KEY_MOUSE_LEFT) {
+        editor->is_mousedown = 0;
+        m_btn = 0;
+        m_bview = NULL;
+        _editor_status_click(editor, ev->x);
+        return;
+    }
+    if (ev->key == TB_KEY_MOUSE_WHEEL_UP || ev->key == TB_KEY_MOUSE_WHEEL_DOWN) {
+        root = editor->active_edit_root ? editor->active_edit_root : bview_get_split_root(editor->active);
+        bview = _editor_bview_at(root, ev->x, ev->y);
+        if (!bview) return;
+        bview_set_viewport_y(bview, bview->viewport_mark->bline->line_index + (ev->key == TB_KEY_MOUSE_WHEEL_UP ? -3 : 3), 0);
+        return;
+    }
+
+    root = editor->active_edit_root ? editor->active_edit_root : bview_get_split_root(editor->active);
+    bview = _editor_bview_at(root, ev->x, ev->y);
+
+    if (ev->key == TB_KEY_MOUSE_RELEASE) {
+        cursor = (m_bview && m_bview->active_cursor) ? m_bview->active_cursor : NULL;
+        editor->is_mousedown = 0;
+        if (m_btn == TB_KEY_MOUSE_RIGHT) {
+            m_btn = 0;
+            return;
+        }
+        if (cursor && m_bview && m_bview->is_menu && !m_moved) {
+            _editor_menu_click(editor, m_bview);
+        } else if (cursor && cursor->is_anchored && mark_is_eq(cursor->mark, cursor->anchor)) {
+            cursor_lift_anchor(cursor);
+        } else if (cursor && cursor->is_anchored && editor->mouse_copy && (m_moved || m_clicks > 1)) {
+            cursor_copy_anchor(cursor, 1);
+        }
+        m_btn = 0;
+        m_gutter = 0;
+        return;
+    }
+
+    if (!bview) {
+        if (ev->key == TB_KEY_MOUSE_LEFT) editor->is_mousedown = 0;
         return;
     }
     cursor = bview->active_cursor;
+    if (!cursor) return;
 
-    drop_anchor = 0;
-    if (ev->key == TB_KEY_MOUSE_LEFT) {
-        if (!editor->is_mousedown) {
-            editor->is_mousedown = 1;
-            drop_anchor = 1;
-        }
-        mark = cursor->mark;
-    } else {
+    if (ev->y == bview->rect_caption.y
+        && ev->x >= bview->rect_caption.x
+        && ev->x < bview->rect_caption.x + bview->rect_caption.w
+    ) {
+        if (ev->key == TB_KEY_MOUSE_LEFT) editor_set_active(editor, bview);
+        return;
+    }
+
+    in_text = ev->x >= bview->rect_buffer.x
+        && ev->x < bview->rect_buffer.x + bview->rect_buffer.w
+        && ev->y >= bview->rect_buffer.y
+        && ev->y < bview->rect_buffer.y + bview->rect_buffer.h;
+    in_gutter = ev->y >= bview->rect_buffer.y
+        && ev->y < bview->rect_buffer.y + bview->rect_buffer.h
+        && ev->x >= bview->x
+        && ev->x < bview->rect_buffer.x;
+
+    if (ev->key == TB_KEY_MOUSE_MIDDLE && in_text) {
+        if (bview_screen_to_bline_col(bview, ev->x, ev->y, &bview, &bline, &col) != MLE_OK) return;
+        editor_set_active(editor, bview);
+        cursor = bview->active_cursor;
+        mark_move_to_w_bline(cursor->mark, bline, col);
+        cursor_paste_clipboard(cursor);
+        return;
+    }
+
+    if (ev->key == TB_KEY_MOUSE_RIGHT && (in_text || in_gutter)) {
+        editor_set_active(editor, bview);
         editor->is_mousedown = 0;
-        if (ev->key == TB_KEY_MOUSE_RELEASE
-            && cursor->is_anchored
-            && mark_is_eq(cursor->mark, cursor->anchor)
-        ) {
-            cursor_lift_anchor(cursor);
+        m_btn = TB_KEY_MOUSE_RIGHT;
+        m_bview = bview;
+        m_moved = 0;
+        if (in_gutter && _editor_line_at(bview, ev->y, &bline)) {
+            _editor_select_lines(cursor, bline, bline);
+        } else if (bview_screen_to_bline_col(bview, ev->x, ev->y, &bview, &bline, &col) == MLE_OK) {
+            cursor = bview->active_cursor;
+            _editor_select_word_at(cursor, bline, col);
+        }
+        if (editor->mouse_copy && cursor->is_anchored && !mark_is_eq(cursor->mark, cursor->anchor)) {
+            cursor_copy_anchor(cursor, 1);
         }
         return;
     }
 
-    mark_move_to_w_bline(mark, bline, col);
-    editor_set_active(editor, bview);
-    // TODO move other cursors?
+    if (ev->key != TB_KEY_MOUSE_LEFT) return;
 
-    if (drop_anchor) {
-        if (cursor->is_anchored) {
-            cursor_lift_anchor(cursor);
+    if (bview->is_menu && _editor_line_at(bview, ev->y, &bline)) {
+        editor_set_active(editor, bview);
+        if (cursor->is_anchored) cursor_lift_anchor(cursor);
+        mark_move_to_w_bline(cursor->mark, bline, 0);
+        m_bview = bview;
+        m_btn = TB_KEY_MOUSE_LEFT;
+        m_moved = editor->is_mousedown ? 1 : 0;
+        editor->is_mousedown = 1;
+        return;
+    }
+
+    if (!in_text && !in_gutter) return;
+
+    editor_set_active(editor, bview);
+    extend = (ev->mod & TB_MOD_SHIFT) ? 1 : 0;
+    now = _editor_mono_ms();
+
+    if (!editor->is_mousedown) {
+        editor->is_mousedown = 1;
+        m_btn = TB_KEY_MOUSE_LEFT;
+        m_bview = bview;
+        m_moved = 0;
+        m_gutter = in_gutter;
+        if (ev->x == m_last_x && ev->y == m_last_y && now - m_last_ms < 400) m_clicks += 1;
+        else m_clicks = 1;
+        m_last_ms = now;
+        m_last_x = ev->x;
+        m_last_y = ev->y;
+
+        if (in_gutter && _editor_line_at(bview, ev->y, &bline)) {
+            _editor_select_lines(cursor, bline, bline);
+            m_anchor_line = (int)bline->line_index;
+            m_anchor_col = 0;
+            return;
         }
+        if (bview_screen_to_bline_col(bview, ev->x, ev->y, &bview, &bline, &col) != MLE_OK) return;
+        cursor = bview->active_cursor;
+        if (m_clicks >= 3) {
+            _editor_select_lines(cursor, bline, bline);
+            m_anchor_line = (int)bline->line_index;
+            m_anchor_col = 0;
+            return;
+        }
+        if (m_clicks == 2) {
+            m_anchor_line = (int)bline->line_index;
+            m_anchor_col = col;
+            _editor_select_word_at(cursor, bline, col);
+            return;
+        }
+        if (extend && cursor->is_anchored) {
+            m_anchor_line = (int)cursor->anchor->bline->line_index;
+            m_anchor_col = cursor->anchor->col;
+            _editor_select_span(cursor, bline, col, m_anchor_line, m_anchor_col);
+            return;
+        }
+        if (cursor->is_anchored) cursor_lift_anchor(cursor);
+        mark_move_to_w_bline(cursor->mark, bline, col);
+        cursor_drop_anchor(cursor, 1);
+        cursor->is_temp_anchored = 1;
+        m_anchor_line = (int)bline->line_index;
+        m_anchor_col = col;
+        return;
+    }
+
+    if (m_bview) bview = m_bview;
+    cursor = bview->active_cursor;
+    if (!cursor) return;
+    if (ev->x != m_last_x || ev->y != m_last_y) {
+        m_moved = 1;
+        m_last_x = ev->x;
+        m_last_y = ev->y;
+    }
+    if (!m_moved) return;
+    if ((m_gutter || m_clicks >= 3) && _editor_line_at(bview, ev->y, &bline)) {
+        bline_t *origin = NULL;
+        buffer_get_bline_w_hint(bview->buffer, m_anchor_line, bline, &origin);
+        if (!origin) origin = bline;
+        _editor_select_lines(cursor, origin, bline);
+        return;
+    }
+    if (bview_screen_to_bline_col(bview, ev->x, ev->y, &bview, &bline, &col) != MLE_OK) return;
+    cursor = bview->active_cursor;
+    if (m_clicks == 2) {
+        _editor_select_words(cursor, bline, col, m_anchor_line, m_anchor_col);
+        return;
+    }
+    cursor = bview->active_cursor;
+    if (!cursor->is_anchored) {
+        mark_move_to_w_bline(cursor->mark, bline, m_anchor_col);
         cursor_drop_anchor(cursor, 1);
         cursor->is_temp_anchored = 1;
     }
+    _editor_select_span(cursor, bline, col, m_anchor_line, m_anchor_col);
 }
 
 static void _editor_append_pastebuf(editor_t *editor, cmd_context_t *ctx, kinput_t *input) {
@@ -1761,7 +2283,13 @@ static void _editor_register_cmds(editor_t *editor) {
     _editor_register_cmd_fn(editor, "cmd_search_next", cmd_search_next);
     _editor_register_cmd_fn(editor, "cmd_search_prev", cmd_search_prev);
     _editor_register_cmd_fn(editor, "cmd_set_opt", cmd_set_opt);
+    _editor_register_cmd_fn(editor, "cmd_options", cmd_options);
+    _editor_register_cmd_fn(editor, "cmd_options_dismiss", cmd_options_dismiss);
+    _editor_register_cmd_fn(editor, "cmd_paste_sys", cmd_paste_sys);
+    _editor_register_cmd_fn(editor, "cmd_side", cmd_side);
+    _editor_register_cmd_fn(editor, "cmd_guide", cmd_guide);
     _editor_register_cmd_fn(editor, "cmd_shell", cmd_shell);
+    _editor_register_cmd_fn(editor, "cmd_iterm", cmd_iterm);
     _editor_register_cmd_fn(editor, "cmd_show_help", cmd_show_help);
     _editor_register_cmd_fn(editor, "cmd_split_horizontal", cmd_split_horizontal);
     _editor_register_cmd_fn(editor, "cmd_split_vertical", cmd_split_vertical);
@@ -1798,7 +2326,11 @@ static void _editor_register_cmds(editor_t *editor) {
 // Init built-in kmaps
 static void _editor_init_kmaps(editor_t *editor) {
     _editor_init_kmap(editor, &editor->kmap_normal, "mle_normal", "cmd_insert_data", 0, (kbinding_def_t[]){
+        MLE_KBINDING_DEF("cmd_guide", "f1"),
         MLE_KBINDING_DEF("cmd_show_help", "f2"),
+        MLE_KBINDING_DEF("cmd_options", "f8"),
+        MLE_KBINDING_DEF("cmd_side", "f9"),
+        MLE_KBINDING_DEF_EX("cmd_side", "f10", "git"),
         MLE_KBINDING_DEF("cmd_delete_before", "backspace"),
         MLE_KBINDING_DEF("cmd_delete_before", "C-h"),
         MLE_KBINDING_DEF("cmd_delete_after", "delete"),
@@ -1854,6 +2386,7 @@ static void _editor_init_kmaps(editor_t *editor) {
         MLE_KBINDING_DEF("cmd_cut", "C-k"),
         MLE_KBINDING_DEF("cmd_copy", "M-k"),
         MLE_KBINDING_DEF("cmd_uncut", "C-u"),
+        MLE_KBINDING_DEF("cmd_paste_sys", "S-insert"),
         MLE_KBINDING_DEF("cmd_uncut_last", "CM-u"),
         MLE_KBINDING_DEF("cmd_redraw", "M-x l"),
         MLE_KBINDING_DEF("cmd_less", "M-l"),
@@ -1946,6 +2479,37 @@ static void _editor_init_kmaps(editor_t *editor) {
         MLE_KBINDING_DEF("cmd_outdent", "backtab"),
         MLE_KBINDING_DEF("cmd_ctag", "f3"),
         MLE_KBINDING_DEF("cmd_shell", "M-e"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-`", "toggle"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "f7", "toggle"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "CS-~", "toggle"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-T", "new"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t n", "new"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t N", "newcmd"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t x", "close"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t k", "kill"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t ]", "next"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t [", "prev"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t o", "pane"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t v", "splitv"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t s", "splith"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t w", "unfocus"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t f", "focus"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t q", "hide"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t +", "grow"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t =", "grow"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t -", "shrink"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t ,", "splitsmaller"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t .", "splitbigger"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t b", "bottom"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t t", "top"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t l", "left"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t r", "right"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t m", "max"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t y", "copy"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t p", "paste"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t c", "clear"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t R", "rename"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "M-t ?", "help"),
         MLE_KBINDING_DEF("cmd_perl", "M-w"),
         MLE_KBINDING_DEF("cmd_jump", "M-j"),
         MLE_KBINDING_DEF("cmd_close", "M-c"),
@@ -1953,7 +2517,49 @@ static void _editor_init_kmaps(editor_t *editor) {
         MLE_KBINDING_DEF("cmd_quit", "C-x"),
         MLE_KBINDING_DEF(NULL, NULL)
     });
-    _editor_init_kmap(editor, &editor->kmap_prompt_input, "mle_prompt_input", NULL, 1, (kbinding_def_t[]){
+    /* Everyday keys sit on top and fall through, so every other binding stays. */
+    _editor_init_kmap(editor, &editor->kmap_basic, "mle_basic", NULL, 1, (kbinding_def_t[]){
+        MLE_KBINDING_DEF("cmd_move_left", "left"),
+        MLE_KBINDING_DEF("cmd_move_right", "right"),
+        MLE_KBINDING_DEF("cmd_move_up", "up"),
+        MLE_KBINDING_DEF("cmd_move_down", "down"),
+        MLE_KBINDING_DEF("cmd_move_bol", "home"),
+        MLE_KBINDING_DEF("cmd_move_eol", "end"),
+        MLE_KBINDING_DEF("cmd_move_page_up", "pgup"),
+        MLE_KBINDING_DEF("cmd_move_page_down", "pgdn"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-left", "left"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-right", "right"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-up", "up"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-down", "down"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-home", "bol"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-end", "eol"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-pgup", "page_up"),
+        MLE_KBINDING_DEF_EX("cmd_move_temp_anchor", "S-pgdn", "page_down"),
+        MLE_KBINDING_DEF("cmd_move_word_back", "C-left"),
+        MLE_KBINDING_DEF("cmd_move_word_forward", "C-right"),
+        MLE_KBINDING_DEF("cmd_delete_before", "backspace"),
+        MLE_KBINDING_DEF("cmd_delete_after", "delete"),
+        MLE_KBINDING_DEF("cmd_delete_word_before", "C-w"),
+        MLE_KBINDING_DEF("cmd_save", "C-s"),
+        MLE_KBINDING_DEF("cmd_open_file", "C-o"),
+        MLE_KBINDING_DEF("cmd_quit", "C-x"),
+        MLE_KBINDING_DEF("cmd_undo", "C-z"),
+        MLE_KBINDING_DEF("cmd_redo", "C-y"),
+        MLE_KBINDING_DEF("cmd_search", "C-f"),
+        MLE_KBINDING_DEF("cmd_search_next", "C-g"),
+        MLE_KBINDING_DEF("cmd_open_new", "C-n"),
+        MLE_KBINDING_DEF("cmd_cut", "C-k"),
+        MLE_KBINDING_DEF("cmd_uncut", "C-u"),
+        MLE_KBINDING_DEF("cmd_paste_sys", "S-insert"),
+        MLE_KBINDING_DEF("cmd_guide", "f1"),
+        MLE_KBINDING_DEF("cmd_show_help", "f2"),
+        MLE_KBINDING_DEF_EX("cmd_iterm", "f7", "toggle"),
+        MLE_KBINDING_DEF("cmd_options", "f8"),
+        MLE_KBINDING_DEF("cmd_side", "f9"),
+        MLE_KBINDING_DEF_EX("cmd_side", "f10", "git"),
+        MLE_KBINDING_DEF(NULL, NULL)
+    });
+    _editor_init_kmap(editor, &editor->kmap_prompt_input, "mle_prompt_input", "cmd_insert_data", 0, (kbinding_def_t[]){
         MLE_KBINDING_DEF("_editor_prompt_input_submit", "enter"),
         MLE_KBINDING_DEF("_editor_prompt_input_submit", "M-enter"),
         MLE_KBINDING_DEF("_editor_prompt_input_complete", "tab"),
@@ -1962,6 +2568,15 @@ static void _editor_init_kmaps(editor_t *editor) {
         MLE_KBINDING_DEF("_editor_prompt_cancel", "M-c"),
         MLE_KBINDING_DEF("_editor_prompt_history_up", "up"),
         MLE_KBINDING_DEF("_editor_prompt_history_down", "down"),
+        MLE_KBINDING_DEF("cmd_move_left", "left"),
+        MLE_KBINDING_DEF("cmd_move_right", "right"),
+        MLE_KBINDING_DEF("cmd_move_bol", "home"),
+        MLE_KBINDING_DEF("cmd_move_bol", "C-a"),
+        MLE_KBINDING_DEF("cmd_move_eol", "end"),
+        MLE_KBINDING_DEF("cmd_move_eol", "C-e"),
+        MLE_KBINDING_DEF("cmd_delete_before", "backspace"),
+        MLE_KBINDING_DEF("cmd_delete_after", "delete"),
+        MLE_KBINDING_DEF("cmd_paste_sys", "S-insert"),
         MLE_KBINDING_DEF(NULL, NULL)
     });
     _editor_init_kmap(editor, &editor->kmap_prompt_yn, "mle_prompt_yn", NULL, 0, (kbinding_def_t[]){
@@ -1990,7 +2605,11 @@ static void _editor_init_kmaps(editor_t *editor) {
         MLE_KBINDING_DEF("_editor_menu_cancel", "C-c"),
         MLE_KBINDING_DEF(NULL, NULL)
     });
-    _editor_init_kmap(editor, &editor->kmap_prompt_isearch, "mle_prompt_isearch", NULL, 1, (kbinding_def_t[]){
+    _editor_init_kmap(editor, &editor->kmap_options, "mle_options", NULL, 1, (kbinding_def_t[]){
+        MLE_KBINDING_DEF("cmd_options_dismiss", "escape"),
+        MLE_KBINDING_DEF(NULL, NULL)
+    });
+    _editor_init_kmap(editor, &editor->kmap_prompt_isearch, "mle_prompt_isearch", "cmd_insert_data", 0, (kbinding_def_t[]){
         MLE_KBINDING_DEF("_editor_prompt_isearch_prev", "up"),
         MLE_KBINDING_DEF("_editor_prompt_isearch_next", "down"),
         MLE_KBINDING_DEF("_editor_prompt_isearch_viewport_up", "pgup"),
@@ -2004,6 +2623,15 @@ static void _editor_init_kmaps(editor_t *editor) {
         MLE_KBINDING_DEF("_editor_prompt_history_up", "C-r"),
         MLE_KBINDING_DEF("_editor_prompt_history_up", "C-p"),
         MLE_KBINDING_DEF("_editor_prompt_history_down", "C-n"),
+        MLE_KBINDING_DEF("cmd_move_left", "left"),
+        MLE_KBINDING_DEF("cmd_move_right", "right"),
+        MLE_KBINDING_DEF("cmd_move_bol", "home"),
+        MLE_KBINDING_DEF("cmd_move_bol", "C-a"),
+        MLE_KBINDING_DEF("cmd_move_eol", "end"),
+        MLE_KBINDING_DEF("cmd_move_eol", "C-e"),
+        MLE_KBINDING_DEF("cmd_delete_before", "backspace"),
+        MLE_KBINDING_DEF("cmd_delete_after", "delete"),
+        MLE_KBINDING_DEF("cmd_paste_sys", "S-insert"),
         MLE_KBINDING_DEF(NULL, NULL)
     });
 }
@@ -2084,7 +2712,10 @@ static int _editor_init_kmap_add_binding_to_trie(kbinding_t **trie, char *cmd_na
             return MLE_ERR;
         }
     } else {
-        // Leaf node, set cmd
+        // Leaf node, set cmd. Replacing a binding frees the previous strings.
+        if (node->static_param) free(node->static_param);
+        if (node->cmd_name) free(node->cmd_name);
+        if (node->key_patt) free(node->key_patt);
         node->static_param = static_param ? strdup(static_param) : NULL;
         node->key_patt = strdup(full_key_patt);
         node->cmd_name = strdup(cmd_name);
@@ -2184,6 +2815,17 @@ static int _editor_add_macro_by_str(editor_t *editor, char *str) {
 
 // Init built-in syntax map
 static void _editor_init_syntaxes(editor_t *editor) {
+    /* Registered first, so it is tried last and only colors files nothing else claims. */
+    _editor_init_syntax(editor, NULL, "syn_text", ".", -1, -1, (srule_def_t[]){
+        { "'([^'\\\\]|\\\\.)*'",                       NULL,              TB_YELLOW | TB_BOLD,     TB_DEFAULT },
+        { "\"([^\"\\\\]|\\\\.)*\"",                    NULL,              TB_YELLOW | TB_BOLD,     TB_DEFAULT },
+        { "/\\*",                                      "\\*/",            TB_CYAN,                 TB_DEFAULT },
+        { "//.*$",                                     NULL,              TB_CYAN,                 TB_DEFAULT },
+        { "#.*$",                                      NULL,              TB_CYAN,                 TB_DEFAULT },
+        { "\\b(-?(0x)?[0-9]+(\\.[0-9]+)?)\\b",         NULL,              TB_BLUE | TB_BOLD,       TB_DEFAULT },
+        { "\\b(true|false|null|none|nil)\\b",          NULL,              TB_MAGENTA | TB_BOLD,    TB_DEFAULT },
+        { NULL, NULL, 0, 0 }
+    });
     _editor_init_syntax(editor, NULL, "syn_generic", "\\.(c|cc|cpp|h|hh|hpp|d|php|py|rb|erb|sh|pl|go|js|java|jsp|lua|rs|zig)$", -1, -1, (srule_def_t[]){
         { "'([^'\\\\]|\\\\.)*'",                       NULL,              TB_YELLOW | TB_BOLD,     TB_DEFAULT },
         { "\"([^\"\\\\]|\\\\.)*\"",                    NULL,              TB_YELLOW | TB_BOLD,     TB_DEFAULT },
@@ -2225,6 +2867,7 @@ static void _editor_init_syntaxes(editor_t *editor) {
           ")\\b", NULL, TB_GREEN, TB_DEFAULT },
         { NULL, NULL, 0, 0 }
     });
+    syntax_extra_init(editor);
 }
 
 // Init a single syntax
@@ -2238,7 +2881,9 @@ static void _editor_init_syntax(editor_t *editor, syntax_t **optret_syntax, char
     syntax->tab_to_space = tab_to_space >= 0 ? (tab_to_space ? 1 : 0) : -1;
 
     while (defs && defs->re) {
-        _editor_init_syntax_add_rule(syntax, defs);
+        if (_editor_init_syntax_add_rule(syntax, defs) != MLE_OK) {
+            fprintf(stderr, "mle: syntax %s rejected rule: %.120s\n", name, defs->re);
+        }
         defs++;
     }
     HASH_ADD_KEYPTR(hh, editor->syntax_map, syntax->name, strlen(syntax->name), syntax);

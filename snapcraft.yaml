@@ -19,7 +19,7 @@ apps:
 parts:
   mle:
     plugin: make
-    source: https://github.com/adsr/mle.git
+    source: https://github.com/quomy-code/MLE-Code.git
     source-commit: 623d6da427a3037181051a8ac94142fa7ae464b5
     source-type: git
     make-parameters: ["-j1", "mle_vendor=1", "mle_static=1"]

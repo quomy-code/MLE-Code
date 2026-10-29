@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/select.h>
 #include <utlist.h>
 #include "mle.h"
 
@@ -63,7 +64,9 @@ int util_shell_exec(editor_t *editor, char *cmd, long timeout_s, char *input, si
         // Write to shell cmd if input is remaining
         if (do_write && writefd >= 0) {
             rc = write(writefd, input, input_len);
-            if (rc > 0) {
+            if (rc < 0 && errno == EINTR) {
+                continue;
+            } else if (rc > 0) {
                 input += rc;
                 input_len -= rc;
                 if (input_len < 1) {
@@ -91,6 +94,7 @@ int util_shell_exec(editor_t *editor, char *cmd, long timeout_s, char *input, si
             FD_SET(readfd, &readfds);
             rc = select(readfd + 1, &readfds, NULL, NULL, timeoutptr);
             if (rc < 0) {
+                if (errno == EINTR) continue;
                 // Err on select
                 MLE_SET_ERR(editor, "select error: %s", strerror(errno));
                 rv = MLE_ERR;
@@ -102,9 +106,14 @@ int util_shell_exec(editor_t *editor, char *cmd, long timeout_s, char *input, si
             } else {
                 // Read a kilobyte of data
                 str_ensure_cap(&readbuf, readbuf.len + 1024);
+                if (!readbuf.data || readbuf.cap < readbuf.len + 1024) {
+                    MLE_SET_ERR(editor, "%s", "read buffer allocation failed");
+                    rv = MLE_ERR;
+                    break;
+                }
                 nbytes = read(readfd, readbuf.data + readbuf.len, 1024);
                 if (nbytes < 0) {
-                    // read err or EAGAIN/EWOULDBLOCK
+                    if (errno == EINTR) continue;
                     MLE_SET_ERR(editor, "read error: %s", strerror(errno));
                     rv = MLE_ERR;
                     break;
@@ -116,12 +125,20 @@ int util_shell_exec(editor_t *editor, char *cmd, long timeout_s, char *input, si
         }
     } while(nbytes > 0); // until EOF
 
-    // Close pipes and reap child proc
+    // Close pipes and reap child proc. WNOHANG used to leave the child as a zombie.
     if (readfd >= 0) close(readfd);
     if (writefd >= 0) close(writefd);
     exit_status = -1;
-    waitpid(pid, &exit_status, do_read ? WNOHANG : 0);
-    if (optret_exit_code) *optret_exit_code = WEXITSTATUS(exit_status);
+    if (pid > 0) {
+        int wr;
+        if (rv != MLE_OK) kill(pid, SIGKILL);
+        do {
+            wr = waitpid(pid, &exit_status, 0);
+        } while (wr < 0 && errno == EINTR);
+        if (optret_exit_code) *optret_exit_code = wr > 0 ? WEXITSTATUS(exit_status) : -1;
+    } else if (optret_exit_code) {
+        *optret_exit_code = -1;
+    }
 
     if (do_read) {
         *optret_output = readbuf.data;
@@ -152,14 +169,22 @@ int util_popen2(char *cmd, int do_setsid, char *opt_shell, int *optret_fdread, i
     // Set shell
     opt_shell = opt_shell ? opt_shell : "sh";
 
-    // Make pipes
-    if (do_read) if (pipe(pout)) return 0;
-    if (do_write) if (pipe(pin)) return 0;
+    // Make pipes. Close whatever we opened if a later step fails.
+    pout[0] = pout[1] = pin[0] = pin[1] = -1;
+    if (do_read && pipe(pout) != 0) return 0;
+    if (do_write && pipe(pin) != 0) {
+        if (pout[0] >= 0) close(pout[0]);
+        if (pout[1] >= 0) close(pout[1]);
+        return 0;
+    }
 
     // Fork
     pid = fork();
     if (pid < 0) {
-        // Fork failed
+        if (pout[0] >= 0) close(pout[0]);
+        if (pout[1] >= 0) close(pout[1]);
+        if (pin[0] >= 0) close(pin[0]);
+        if (pin[1] >= 0) close(pin[1]);
         return 0;
     } else if (pid == 0) {
         // Child
@@ -332,7 +357,10 @@ char *util_escape_shell_arg(char *str, int l) {
     int x, y = 0;
     char *cmd;
 
-    cmd = malloc(4 * l + 3); // worst case
+    if (l < 0) l = 0;
+    if (!str) l = 0;
+    cmd = malloc((size_t)4 * (size_t)l + 3); // worst case
+    if (!cmd) return NULL;
 
     cmd[y++] = '\'';
 
@@ -343,7 +371,11 @@ char *util_escape_shell_arg(char *str, int l) {
         if (mb_len < 0) {
             continue;
         } else if (mb_len > 1) {
-            memcpy(cmd + y, str + x, mb_len);
+            if (mb_len > l - x) {
+                cmd[y++] = str[x];
+                continue;
+            }
+            memcpy(cmd + y, str + x, (size_t)mb_len);
             y += mb_len;
             x += mb_len - 1;
             continue;
@@ -505,6 +537,7 @@ void str_set(str_t *str, char *data) {
 // Set str to data for data_len bytes
 void str_set_len(str_t *str, char *data, size_t data_len) {
     str_ensure_cap(str, data_len+1);
+    if (!str->data || str->cap < data_len + 1) return;
     memcpy(str->data, data, data_len);
     str->len = data_len;
     *(str->data + str->len) = '\0';
@@ -518,8 +551,10 @@ void str_sprintf(str_t *str, const char *fmt, ...) {
     va_start(va, fmt);
     len = vsnprintf(NULL, 0, fmt, va);
     va_end(va);
+    if (len < 0) return;
 
     str_ensure_cap(str, str->len + (size_t)len + 1);
+    if (!str->data || str->cap < str->len + (size_t)len + 1) return;
 
     va_start(va, fmt);
     vsprintf(str->data + str->len, fmt, va);
@@ -534,6 +569,7 @@ void str_put_len(str_t *str, char *data, size_t data_len, int is_prepend) {
     req_cap = str->len + data_len + 1;
 
     str_ensure_cap(str, req_cap);
+    if (!str->data || str->cap < req_cap) return;
 
     if (is_prepend) {
         memmove(str->data + data_len, str->data, str->len);
@@ -547,17 +583,21 @@ void str_put_len(str_t *str, char *data, size_t data_len, int is_prepend) {
 
 // Ensure space in str
 void str_ensure_cap(str_t *str, size_t cap) {
-    if (!str->data || cap > str->cap) {
-        if (str->inc >= 0) {
-            // If inc is positive, grow linearly
-            cap = MLBUF_MAX(cap, str->cap + (str->inc > 0 ? str->inc : 128));
-        } else {
-            // If inc is negative, grow geometrically
-            cap = MLBUF_MAX(cap, str->cap * (str->inc <= -2 ? str->inc * -1 : 2));
-        }
-        str->data = realloc(str->data, cap);
-        str->cap = cap;
+    char *grown;
+    size_t want;
+    if (str->data && cap <= str->cap) return;
+    want = cap;
+    if (str->inc >= 0) {
+        // If inc is positive, grow linearly
+        want = MLBUF_MAX(want, str->cap + (str->inc > 0 ? str->inc : 128));
+    } else {
+        // If inc is negative, grow geometrically
+        want = MLBUF_MAX(want, str->cap * (str->inc <= -2 ? str->inc * -1 : 2));
     }
+    grown = realloc(str->data, want);
+    if (!grown) return; // keep the old block; callers must see cap unchanged
+    str->data = grown;
+    str->cap = want;
 }
 
 // Clear str
@@ -655,11 +695,55 @@ void str_append_replace_with_backrefs(str_t *str, char *subj, char *repl, int pc
     }
 }
 
+// Close pipes and reap the child. fdopen FILE* owns the fd, so never close then pclose.
+static void aproc_reap(aproc_t *aproc, int preempt) {
+    pid_t pid;
+    int st;
+    int wr;
+
+    if (!aproc) return;
+    pid = aproc->pid;
+    if (pid > 0 && preempt) kill(pid, SIGKILL);
+    if (aproc->wpipe) {
+        fclose(aproc->wpipe);
+        aproc->wpipe = NULL;
+        aproc->wfd = -1;
+    } else if (aproc->wfd >= 0) {
+        close(aproc->wfd);
+        aproc->wfd = -1;
+    }
+    if (aproc->rpipe) {
+        fclose(aproc->rpipe);
+        aproc->rpipe = NULL;
+        aproc->rfd = -1;
+    } else if (aproc->rfd >= 0) {
+        close(aproc->rfd);
+        aproc->rfd = -1;
+    }
+    if (pid <= 0) return;
+    wr = 0;
+    if (!preempt) {
+        do {
+            wr = waitpid(pid, &st, WNOHANG);
+        } while (wr < 0 && errno == EINTR);
+        if (wr == 0) kill(pid, SIGKILL);
+    }
+    if (wr <= 0) {
+        do {
+            wr = waitpid(pid, &st, 0);
+        } while (wr < 0 && errno == EINTR);
+    }
+    aproc->pid = 0;
+}
+
 // Return a new aproc_t
 aproc_t *aproc_new(editor_t *editor, void *owner, aproc_t **owner_aproc, char *shell_cmd, int rw, aproc_cb_t callback) {
     aproc_t *aproc;
     aproc = calloc(1, sizeof(aproc_t));
+    if (!aproc) return NULL;
     aproc->editor = editor;
+    aproc->rfd = -1;
+    aproc->wfd = -1;
     aproc_set_owner(aproc, owner, owner_aproc);
     if (rw) {
         if (!util_popen2(shell_cmd, 0, NULL, &aproc->rfd, &aproc->wfd, &aproc->pid)) {
@@ -667,11 +751,13 @@ aproc_t *aproc_new(editor_t *editor, void *owner, aproc_t **owner_aproc, char *s
         }
         aproc->rpipe = fdopen(aproc->rfd, "r");
         aproc->wpipe = fdopen(aproc->wfd, "w");
+        if (!aproc->rpipe || !aproc->wpipe) goto aproc_new_failure;
     } else {
-        if (!(aproc->rpipe = popen(shell_cmd, "r"))) {
+        if (!util_popen2(shell_cmd, 0, NULL, &aproc->rfd, NULL, &aproc->pid)) {
             goto aproc_new_failure;
         }
-        aproc->rfd = fileno(aproc->rpipe);
+        aproc->rpipe = fdopen(aproc->rfd, "r");
+        if (!aproc->rpipe) goto aproc_new_failure;
     }
     setvbuf(aproc->rpipe, NULL, _IONBF, 0);
     if (aproc->wpipe) setvbuf(aproc->wpipe, NULL, _IONBF, 0);
@@ -680,6 +766,8 @@ aproc_t *aproc_new(editor_t *editor, void *owner, aproc_t **owner_aproc, char *s
     return aproc;
 
 aproc_new_failure:
+    if (aproc->owner_aproc) *aproc->owner_aproc = NULL;
+    aproc_reap(aproc, 1);
     free(aproc);
     return NULL;
 }
@@ -697,15 +785,10 @@ int aproc_set_owner(aproc_t *aproc, void *owner, aproc_t **owner_aproc) {
 
 // Destroy an aproc_t
 int aproc_destroy(aproc_t *aproc, int preempt) {
+    if (!aproc) return MLE_OK;
     DL_DELETE(aproc->editor->aprocs, aproc);
     if (aproc->owner_aproc) *aproc->owner_aproc = NULL;
-    if (preempt) {
-        if (aproc->rfd) close(aproc->rfd);
-        if (aproc->wfd) close(aproc->wfd);
-        if (aproc->pid) kill(aproc->pid, SIGTERM);
-    }
-    if (aproc->rpipe) pclose(aproc->rpipe);
-    if (aproc->wpipe) pclose(aproc->wpipe);
+    aproc_reap(aproc, preempt);
     free(aproc);
     return MLE_OK;
 }
@@ -740,6 +823,7 @@ int aproc_drain_all(aproc_t *aprocs, int *ttyfd) {
     // Simultaneously check for solo, which takes precedence over everything
     maxfd = *ttyfd;
     DL_FOREACH(aprocs, aproc) {
+        if (aproc->rfd < 0) continue;
         FD_SET(aproc->rfd, &readfds);
         if (aproc->rfd > maxfd) maxfd = aproc->rfd;
     }
@@ -747,7 +831,8 @@ int aproc_drain_all(aproc_t *aprocs, int *ttyfd) {
     // Perform select
     rc = select(maxfd + 1, &readfds, NULL, NULL, NULL);
     if (rc < 0) {
-        return 0; // TODO error
+        if (errno == EINTR) return 1;
+        return 0;
     } else if (rc == 0) {
         return 1; // Nothing to read, call again
     }
@@ -759,21 +844,46 @@ int aproc_drain_all(aproc_t *aprocs, int *ttyfd) {
         // Read async procs
         DL_FOREACH_SAFE(aprocs, aproc, aproc_tmp) {
             // Read and invoke callback
-            if (FD_ISSET(aproc->rfd, &readfds)) {
-                nbytes = read(aproc->rfd, &buf, 1024);
+            if (aproc->rfd >= 0 && FD_ISSET(aproc->rfd, &readfds)) {
+                nbytes = read(aproc->rfd, buf, 1024);
+                if (nbytes < 0) {
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                    nbytes = 0;
+                    aproc->is_done = 1;
+                }
                 buf[nbytes] = '\0';
                 if (nbytes == 0) aproc->is_done = 1;
-                aproc->callback(aproc, buf, nbytes);
+                if (aproc->callback) aproc->callback(aproc, buf, (size_t)nbytes);
             }
             // Destroy on eof.
             // Not sure if ferror and feof have any effect here given we're not
             // using fread.
-            if (ferror(aproc->rpipe) || feof(aproc->rpipe) || aproc->is_done) {
+            if (aproc->is_done || (aproc->rpipe && (ferror(aproc->rpipe) || feof(aproc->rpipe)))) {
                 aproc_destroy(aproc, 0);
             }
         }
     }
 
+    return 1;
+}
+
+/* Read one ready aproc fd. Return 1 if bytes were delivered or the proc ended. */
+int aproc_read_ready(aproc_t *aproc) {
+    char buf[1024 + 1];
+    ssize_t nbytes;
+
+    if (!aproc || aproc->rfd < 0) return 0;
+    nbytes = read(aproc->rfd, buf, 1024);
+    if (nbytes < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        nbytes = 0;
+        aproc->is_done = 1;
+    }
+    buf[nbytes] = '\0';
+    if (nbytes == 0) aproc->is_done = 1;
+    if (aproc->callback) aproc->callback(aproc, buf, (size_t)nbytes);
+    if (aproc->rpipe && (ferror(aproc->rpipe) || feof(aproc->rpipe))) aproc->is_done = 1;
+    if (aproc->is_done) aproc_destroy(aproc, 0);
     return 1;
 }
 
@@ -810,4 +920,257 @@ int utf8_char_to_unicode(uint32_t *out, const char *c, const char *stop) {
 
     *out = result;
     return (int)len;
+}
+
+static int clip_write_all(int fd, const char *data, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, data, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        data += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int clip_tool(const char *name) {
+    char *path;
+    char *dup;
+    char *dir;
+    char *save;
+    char buf[512];
+    if (!name || !name[0]) return 0;
+    if (strchr(name, '/')) return access(name, X_OK) == 0;
+    path = getenv("PATH");
+    if (!path || !path[0]) path = "/usr/bin:/bin";
+    dup = strdup(path);
+    if (!dup) return 0;
+    for (dir = strtok_r(dup, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+        snprintf(buf, sizeof(buf), "%s/%s", dir, name);
+        if (access(buf, X_OK) == 0) {
+            free(dup);
+            return 1;
+        }
+    }
+    free(dup);
+    return 0;
+}
+
+/* Read stdout until the child exits or `ms` elapses. Does not kill a child
+ * that is still running: xclip must stay alive to own the X selection. */
+static int clip_read_child(pid_t pid, int rfd, char **out, size_t *out_len, int ms) {
+    str_t buf = {0};
+    int status = 0;
+    int spun = 0;
+    if (rfd >= 0) fcntl(rfd, F_SETFL, O_NONBLOCK);
+    for (;;) {
+        if (rfd >= 0) {
+            char tmp[4096];
+            ssize_t n;
+            while ((n = read(rfd, tmp, sizeof(tmp))) > 0) {
+                if (buf.len + (size_t)n > (1u << 20)) n = (ssize_t)((1u << 20) - buf.len);
+                if (n > 0) str_append_len(&buf, tmp, (size_t)n);
+                if (buf.len >= (1u << 20)) break;
+            }
+        }
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            if (rfd >= 0) {
+                char tmp[4096];
+                ssize_t n;
+                while ((n = read(rfd, tmp, sizeof(tmp))) > 0) {
+                    if (buf.len < (1u << 20)) str_append_len(&buf, tmp, (size_t)n);
+                }
+            }
+            break;
+        }
+        if (spun >= ms) break;
+        {
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 10000;
+            select(0, NULL, NULL, NULL, &tv);
+        }
+        spun += 10;
+    }
+    if (out) {
+        if (!buf.data) {
+            buf.data = strdup("");
+            buf.len = 0;
+        }
+        *out = buf.data;
+        if (out_len) *out_len = buf.len;
+    } else if (buf.data) {
+        free(buf.data);
+    }
+    if (waitpid(pid, &status, WNOHANG) == 0) return 0;
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+static int clip_run(char **argv, const char *in, size_t in_len, char **out, size_t *out_len, int detach) {
+    int ip[2];
+    int op[2];
+    pid_t pid;
+    ip[0] = ip[1] = op[0] = op[1] = -1;
+    if (out && pipe(op) != 0) return -1;
+    if (in && pipe(ip) != 0) {
+        if (op[0] >= 0) close(op[0]);
+        if (op[1] >= 0) close(op[1]);
+        return -1;
+    }
+    pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (detach) {
+            pid_t mid = fork();
+            if (mid < 0) _exit(127);
+            if (mid > 0) _exit(0);
+        }
+        if (ip[0] >= 0) {
+            dup2(ip[0], STDIN_FILENO);
+            close(ip[0]);
+            close(ip[1]);
+        } else {
+            int d = open("/dev/null", O_RDONLY);
+            if (d >= 0) { dup2(d, STDIN_FILENO); close(d); }
+        }
+        if (op[1] >= 0) {
+            dup2(op[1], STDOUT_FILENO);
+            close(op[0]);
+            close(op[1]);
+        } else {
+            int d = open("/dev/null", O_WRONLY);
+            if (d >= 0) { dup2(d, STDOUT_FILENO); close(d); }
+        }
+        {
+            int d = open("/dev/null", O_WRONLY);
+            if (d >= 0) { dup2(d, STDERR_FILENO); close(d); }
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    if (ip[0] >= 0) close(ip[0]);
+    if (op[1] >= 0) close(op[1]);
+    if (detach) {
+        int status = 0;
+        waitpid(pid, &status, 0);
+        pid = 0;
+    }
+    if (ip[1] >= 0) {
+        clip_write_all(ip[1], in, in_len);
+        close(ip[1]);
+    }
+    if (detach) {
+        if (op[0] >= 0) close(op[0]);
+        if (out) {
+            *out = NULL;
+            if (out_len) *out_len = 0;
+        }
+        return 0;
+    }
+    {
+        int rc = clip_read_child(pid, op[0], out, out_len, 500);
+        if (op[0] >= 0) close(op[0]);
+        return rc;
+    }
+}
+
+static void clip_osc52(const char *text, size_t len) {
+    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *b64;
+    size_t i;
+    size_t o;
+    size_t blen;
+    int fd;
+    if (tb_width() < 0 || !text) return;
+    if (len > (256u * 1024u)) len = 256u * 1024u;
+    blen = 4 * ((len + 2) / 3);
+    b64 = malloc(blen + 1);
+    if (!b64) return;
+    o = 0;
+    for (i = 0; i + 3 <= len; i += 3) {
+        unsigned int v = ((unsigned char)text[i] << 16) | ((unsigned char)text[i + 1] << 8) | (unsigned char)text[i + 2];
+        b64[o++] = tab[(v >> 18) & 63];
+        b64[o++] = tab[(v >> 12) & 63];
+        b64[o++] = tab[(v >> 6) & 63];
+        b64[o++] = tab[v & 63];
+    }
+    if (i < len) {
+        unsigned int v = (unsigned char)text[i] << 16;
+        int rem = 1;
+        if (i + 1 < len) {
+            v |= (unsigned char)text[i + 1] << 8;
+            rem = 2;
+        }
+        b64[o++] = tab[(v >> 18) & 63];
+        b64[o++] = tab[(v >> 12) & 63];
+        b64[o++] = rem == 2 ? tab[(v >> 6) & 63] : '=';
+        b64[o++] = '=';
+    }
+    fd = open("/dev/tty", O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        clip_write_all(fd, "\033]52;c;", 7);
+        clip_write_all(fd, b64, o);
+        clip_write_all(fd, "\a", 1);
+        close(fd);
+    }
+    free(b64);
+}
+
+int util_clipboard_set(const char *text, size_t len) {
+    int ok = 0;
+    if (!text) return MLE_ERR;
+    if (len == 0) len = strlen(text);
+    clip_osc52(text, len);
+    if (tb_width() >= 0) ok = 1;
+    if (getenv("WAYLAND_DISPLAY") && clip_tool("wl-copy")) {
+        char *av[] = {"wl-copy", NULL};
+        if (clip_run(av, text, len, NULL, NULL, 0) == 0) ok = 1;
+    } else if (getenv("DISPLAY") && clip_tool("xclip")) {
+        char *av[] = {"xclip", "-selection", "clipboard", NULL};
+        if (clip_run(av, text, len, NULL, NULL, 1) == 0) ok = 1;
+    } else if (clip_tool("wl-copy")) {
+        char *av[] = {"wl-copy", NULL};
+        if (clip_run(av, text, len, NULL, NULL, 0) == 0) ok = 1;
+    } else if (clip_tool("xclip")) {
+        char *av[] = {"xclip", "-selection", "clipboard", NULL};
+        if (clip_run(av, text, len, NULL, NULL, 1) == 0) ok = 1;
+    } else if (clip_tool("xsel")) {
+        char *av[] = {"xsel", "--clipboard", "--input", NULL};
+        if (clip_run(av, text, len, NULL, NULL, 1) == 0) ok = 1;
+    }
+    return ok ? MLE_OK : MLE_ERR;
+}
+
+int util_clipboard_get(char **out, size_t *out_len) {
+    char *data = NULL;
+    size_t n = 0;
+    int rc = -1;
+    if (out) *out = NULL;
+    if (out_len) *out_len = 0;
+    if (getenv("WAYLAND_DISPLAY") && clip_tool("wl-paste")) {
+        char *av[] = {"wl-paste", "-n", NULL};
+        rc = clip_run(av, NULL, 0, &data, &n, 0);
+    } else if (getenv("DISPLAY") && clip_tool("xclip")) {
+        char *av[] = {"xclip", "-selection", "clipboard", "-o", NULL};
+        rc = clip_run(av, NULL, 0, &data, &n, 0);
+    } else if (clip_tool("wl-paste")) {
+        char *av[] = {"wl-paste", "-n", NULL};
+        rc = clip_run(av, NULL, 0, &data, &n, 0);
+    } else if (clip_tool("xclip")) {
+        char *av[] = {"xclip", "-selection", "clipboard", "-o", NULL};
+        rc = clip_run(av, NULL, 0, &data, &n, 0);
+    } else if (clip_tool("xsel")) {
+        char *av[] = {"xsel", "--clipboard", "--output", NULL};
+        rc = clip_run(av, NULL, 0, &data, &n, 0);
+    }
+    if (rc != 0 || !data) {
+        if (data) free(data);
+        return MLE_ERR;
+    }
+    if (out) *out = data;
+    else free(data);
+    if (out_len) *out_len = n;
+    return MLE_OK;
 }

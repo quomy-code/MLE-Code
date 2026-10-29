@@ -17,4 +17,4 @@ jobs:
           submodules: recursive
 
       - name: test
-        run: make test mle_vendor=1
+        run: make test mle_vendor=1 && test -x dist/mle

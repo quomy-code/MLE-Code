@@ -151,6 +151,7 @@ typedef struct iterm_s {
     int last_width;
     int tab_x;
     int tab_w;
+    int close_x;
     struct iterm_s *next;
     struct iterm_s *prev;
 } iterm_t;
@@ -192,6 +193,10 @@ typedef struct iterm_panel_s {
     iview_t *drag_split;
     int last_btn;
     iview_t *sel_view;
+    int grip; /* 0 none, 1 top row, 2 bottom row, 3 right col, 4 left col */
+    int tab_y;
+    int plus_x;
+    int plus_w;
 } iterm_panel_t;
 
 static const uint8_t ansi_rgb[16][3] = {
@@ -379,20 +384,6 @@ static void clear_row_range(iterm_t *t, row_t *row, int x0, int x1) {
     if (x0 < 0) x0 = 0;
     if (x1 >= row->cols) x1 = row->cols - 1;
     for (x = x0; x <= x1; x++) blank_cell(t, &row->cells[x]);
-}
-
-static void fix_wide_edges(row_t *row, int x0, int x1) {
-    if (!row || !row->cells) return;
-    if (x0 > 0 && x0 < row->cols && row->cells[x0].w == CELL_CONT) {
-        blank_cell_raw(&row->cells[x0 - 1]);
-    }
-    if (x1 >= 0 && x1 < row->cols - 1 && row->cells[x1].w == CELL_WIDE) {
-        blank_cell_raw(&row->cells[x1 + 1]);
-    }
-}
-
-static void blank_cell_raw(cell_t *c) {
-    memset(c, 0, sizeof(*c));
 }
 
 static void term_reset_modes(iterm_t *t) {
@@ -673,13 +664,6 @@ static void leave_alt(iterm_t *t) {
 
 static int cursor_row_base(iterm_t *t) {
     return t->origin_mode ? t->scroll_top : 0;
-}
-
-static int cursor_row_limit(iterm_t *t) {
-    grid_t *g;
-    g = ag(t);
-    if (t->origin_mode) return t->scroll_bot;
-    return g->nrows > 0 ? g->nrows - 1 : 0;
 }
 
 static void move_to(iterm_t *t, int row1, int col1) {
@@ -1113,7 +1097,6 @@ static void csi_dispatch(iterm_t *t, unsigned char final) {
         default:
             break;
     }
-    (void)cursor_row_limit;
 }
 
 static void feed_byte(iterm_t *t, unsigned char b);
@@ -1148,6 +1131,10 @@ static void exec_c0(iterm_t *t, unsigned char b) {
 }
 
 static void feed_byte(iterm_t *t, unsigned char b) {
+    if (b == 0x18 || b == 0x1a) {
+        t->state = ST_GROUND;
+        return;
+    }
     if (t->state == ST_UTF8) {
         if ((b & 0xc0) != 0x80) {
             t->state = ST_GROUND;
@@ -1168,6 +1155,10 @@ static void feed_byte(iterm_t *t, unsigned char b) {
     }
 
     if (t->state == ST_GROUND) {
+        if (b == 0x1b) {
+            t->state = ST_ESC;
+            return;
+        }
         if (b < 0x20) {
             exec_c0(t, b);
             return;
@@ -1256,7 +1247,7 @@ static void feed_byte(iterm_t *t, unsigned char b) {
 
     if (t->state == ST_CSI) {
         if (b >= '0' && b <= '9') csi_digit(t, b - '0');
-        else if (b == ';') csi_semi(t);
+        else if (b == ';' || b == ':') csi_semi(t);
         else if ((b == '?' || b == '>' || b == '!' || b == '=') && t->csi_n == 0 && t->csi_priv == 0) t->csi_priv = b;
         else if (b >= 0x20 && b <= 0x2f) t->csi_inter = b;
         else if (b >= 0x40 && b <= 0x7e) {
@@ -1372,7 +1363,7 @@ static void primary_reflow(iterm_t *t, int cols, int rows) {
     lline_t *lines = NULL;
     int nlines = 0, cap = 0, closed = 1;
     int cur_line = 0, cur_off = 0, i, g;
-    int was_alt, save_cx, save_cy, save_pw;
+    int was_alt, save_cx, save_cy;
     pen_t save_pen;
 
     if (cols < 1) cols = 1;
@@ -1391,7 +1382,6 @@ static void primary_reflow(iterm_t *t, int cols, int rows) {
     was_alt = t->alt_on;
     save_cx = t->cx;
     save_cy = t->cy;
-    save_pw = t->pending_wrap;
     save_pen = t->pen;
 
     if (!was_alt) {
@@ -1675,6 +1665,7 @@ static iterm_t *term_new(int cols, int rows) {
     t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->fd = -1;
+    t->close_x = -1;
     t->cursor_visible = 1;
     t->wrap_mode = 1;
     t->last_width = 1;
@@ -1949,7 +1940,7 @@ static const char *dock_name(int dock) {
     }
 }
 
-static void draw_cell_at(int x, int y, cell_t *c, int selected) {
+static void draw_cell_at(int x, int y, cell_t *c, int selected, editor_t *editor) {
     uint32_t ch;
     uintattr_t fg, bg;
     if (c->attr & ATTR_INVIS) ch = ' ';
@@ -1957,8 +1948,10 @@ static void draw_cell_at(int x, int y, cell_t *c, int selected) {
     fg = tb_fg(c);
     bg = tb_bg(c);
     if (selected) {
-        fg = TB_BLACK | TB_BOLD;
-        bg = TB_CYAN;
+        uint16_t sfg = TB_BLACK, sbg = TB_CYAN;
+        if (editor) theme_selection(editor, &sfg, &sbg);
+        fg = sfg;
+        bg = sbg;
     }
     tb_set_cell(x, y, ch, fg, bg);
 }
@@ -2014,7 +2007,7 @@ static void reveal_copy(iview_t *v) {
 
 static void draw_view(iterm_panel_t *panel, iview_t *v) {
     iterm_t *t;
-    int row, total, top, x, hw;
+    int row, total, top, x;
     if (!v) return;
     if (v->split) {
         draw_view(panel, v->a);
@@ -2054,7 +2047,7 @@ static void draw_view(iterm_panel_t *panel, iview_t *v) {
                 continue;
             }
             sel = cell_selected(v, top + row, x);
-            draw_cell_at(v->x + x, v->y + row, c, sel);
+            draw_cell_at(v->x + x, v->y + row, c, sel, panel->editor);
         }
     }
     if (panel->focused && panel->focus == v) {
@@ -2082,69 +2075,118 @@ static void draw_view(iterm_panel_t *panel, iview_t *v) {
         }
         if (cx >= 0) tb_set_cursor(cx, cy);
         else tb_set_cursor(-1, -1);
-        (void)hw;
+    }
+}
+
+static void tab_box(iterm_panel_t *panel, int *x, int *y, int *w) {
+    int inset = panel->grip == 4 ? 1 : 0;
+    int trim = (panel->grip == 3 || panel->grip == 4) ? 1 : 0;
+    *x = panel->x + inset;
+    *y = panel->y + (panel->grip == 1 ? 1 : 0);
+    *w = panel->w - trim;
+    if (*w < 0) *w = 0;
+}
+
+static int hit_grip(iterm_panel_t *panel, int x, int y) {
+    if (!panel || panel->grip == 0) return 0;
+    if (x < panel->x || y < panel->y || x >= panel->x + panel->w || y >= panel->y + panel->h) return 0;
+    if (panel->grip == 1) return y == panel->y;
+    if (panel->grip == 2) return y == panel->y + panel->h - 1;
+    if (panel->grip == 4) return x == panel->x;
+    if (panel->grip == 3) return x == panel->x + panel->w - 1;
+    return 0;
+}
+
+static void draw_grip(iterm_panel_t *panel) {
+    mle_theme_t *th;
+    uintattr_t fg, bg;
+    int i;
+    if (!panel || panel->grip == 0) return;
+    th = theme_current(panel->editor);
+    fg = th->grip_fg;
+    bg = th->grip_bg;
+    if (panel->grip == 1 || panel->grip == 2) {
+        int y = panel->grip == 1 ? panel->y : panel->y + panel->h - 1;
+        for (i = 0; i < panel->w; i++) tb_set_cell(panel->x + i, y, ' ', fg, bg);
+        if (panel->w >= 12) {
+            const char *s = " drag ";
+            int cx = panel->x + (panel->w / 2) - 3;
+            for (i = 0; s[i]; i++) tb_set_cell(cx + i, y, (uint32_t)s[i], fg, bg);
+        }
+    } else {
+        int x = panel->grip == 4 ? panel->x : panel->x + panel->w - 1;
+        for (i = 0; i < panel->h; i++) tb_set_cell(x, panel->y + i, ' ', fg, bg);
     }
 }
 
 static void draw_tabs(iterm_panel_t *panel) {
     iterm_t *t;
-    iview_t *leaves[64];
-    int nleaves = 0, x, i, badge_w;
-    char badge[64];
-    uintattr_t bar_fg, bar_bg;
-    if (panel->tabh < 1 || panel->w < 1) return;
-    bar_fg = TB_WHITE;
-    bar_bg = TB_BLACK | TB_BRIGHT;
-    for (x = 0; x < panel->w; x++) {
-        tb_set_cell(panel->x + x, panel->y, ' ', bar_fg, bar_bg);
+    int x0, y, tw, x, badge_w, limit, plus_reserve, px;
+    char badge[32];
+    uintattr_t bar_fg, bar_bg, act_fg, act_bg, plus_fg, plus_bg, xfg, xbg;
+    mle_theme_t *th;
+    th = theme_current(panel->editor);
+    tab_box(panel, &x0, &y, &tw);
+    panel->tab_y = y;
+    panel->plus_x = -1;
+    panel->plus_w = 0;
+    DL_FOREACH(panel->terms, t) t->close_x = -1;
+    if (panel->tabh < 1 || tw < 1) return;
+    bar_fg = th->muted_fg;
+    bar_bg = th->muted_bg;
+    act_fg = th->accent_fg;
+    act_bg = th->accent_bg;
+    if (!th->user && th->text_fg == 0 && th->text_bg == 0) {
+        bar_fg = TB_WHITE;
+        bar_bg = TB_BLACK | TB_BRIGHT;
+        act_fg = TB_BLACK | TB_BOLD;
+        act_bg = TB_CYAN;
     }
-    collect_leaves(panel->root, leaves, &nleaves, 64);
-    if (panel->focus && panel->focus->copy_mode) snprintf(badge, sizeof(badge), " COPY ");
-    else if (panel->focused) snprintf(badge, sizeof(badge), " SHELL %s ", dock_name(panel->dock));
-    else snprintf(badge, sizeof(badge), " view %s ", dock_name(panel->dock));
-    if (panel->focus && panel->focus->scroll > 0) {
-        char extra[80];
-        snprintf(extra, sizeof(extra), "%sSCROLL ", badge);
-        snprintf(badge, sizeof(badge), "%s", extra);
+    plus_fg = th->accent_fg;
+    plus_bg = th->accent_bg;
+    xfg = th->err_fg;
+    xbg = th->err_bg;
+    for (x = 0; x < tw; x++) tb_set_cell(x0 + x, y, ' ', bar_fg, bar_bg);
+    badge[0] = '\0';
+    if (tw >= 28) {
+        if (panel->focus && panel->focus->copy_mode) snprintf(badge, sizeof(badge), " COPY ");
+        else snprintf(badge, sizeof(badge), " %s ", dock_name(panel->dock));
     }
     badge_w = (int)strlen(badge);
-    if (panel->hint && panel->hint[0]) {
-        int maxw = panel->w - 1;
-        if (badge_w + 2 < panel->w) maxw = panel->w - badge_w - 1;
-        tb_printf(panel->x, panel->y, TB_BLACK | TB_BOLD, TB_YELLOW, "%.*s", maxw, panel->hint);
-    } else {
-        x = 0;
-        DL_FOREACH(panel->terms, t) {
-            char label[64];
-            int labw, shown = 0, k;
-            uintattr_t fg, bg;
-            for (i = 0; i < nleaves; i++) {
-                if (leaves[i]->term == t && leaves[i]->w > 0) shown = 1;
-            }
-            if (!t->alive) snprintf(label, sizeof(label), " %d:%.24s x ", t->id, t->title[0] ? t->title : "shell");
-            else snprintf(label, sizeof(label), " %d:%.24s ", t->id, t->title[0] ? t->title : "shell");
-            labw = (int)strlen(label);
-            if (x + labw >= panel->w - badge_w - 1) break;
-            if (panel->focus && panel->focus->term == t) {
-                fg = TB_BLACK | TB_BOLD;
-                bg = TB_CYAN;
-            } else if (shown) {
-                fg = TB_WHITE | TB_BOLD;
-                bg = bar_bg;
-            } else {
-                fg = TB_WHITE;
-                bg = bar_bg;
-            }
-            for (k = 0; k < labw; k++) {
-                tb_set_cell(panel->x + x + k, panel->y, (uint32_t)label[k], fg, bg);
-            }
-            t->tab_x = panel->x + x;
-            t->tab_w = labw;
-            x += labw;
+    if (badge_w >= tw) badge_w = 0;
+    limit = tw - badge_w;
+    plus_reserve = limit >= 8 ? 3 : 0;
+    limit -= plus_reserve;
+    x = 0;
+    DL_FOREACH(panel->terms, t) {
+        char label[40];
+        int labw, k;
+        uintattr_t fg, bg;
+        const char *title = t->title[0] ? t->title : "shell";
+        snprintf(label, sizeof(label), " %d:%.12s ", t->id, title);
+        labw = (int)strlen(label);
+        if (x + labw + 1 > limit) break;
+        fg = (panel->focus && panel->focus->term == t) ? act_fg : bar_fg;
+        bg = (panel->focus && panel->focus->term == t) ? act_bg : bar_bg;
+        for (k = 0; k < labw; k++) tb_set_cell(x0 + x + k, y, (uint32_t)label[k], fg, bg);
+        t->tab_x = x0 + x;
+        t->tab_w = labw;
+        tb_set_cell(x0 + x + labw, y, glyphs_decor() ? glyphs_cp(GLY_CLOSE) : (uint32_t)'x', xfg, xbg);
+        t->close_x = x0 + x + labw;
+        x += labw + 1;
+    }
+    if (plus_reserve) {
+        px = tw - badge_w - 3;
+        if (px >= 0 && px + 3 <= tw - badge_w) {
+            tb_set_cell(x0 + px, y, ' ', plus_fg, plus_bg);
+            tb_set_cell(x0 + px + 1, y, glyphs_decor() ? glyphs_cp(GLY_PLUS) : (uint32_t)'+', plus_fg, plus_bg);
+            tb_set_cell(x0 + px + 2, y, ' ', plus_fg, plus_bg);
+            panel->plus_x = x0 + px;
+            panel->plus_w = 3;
         }
     }
-    if (badge_w > 0 && badge_w < panel->w) {
-        tb_printf(panel->x + panel->w - badge_w, panel->y, TB_BLACK | TB_BOLD, TB_WHITE, "%s", badge);
+    if (badge_w > 0 && badge_w <= tw) {
+        tb_printf(x0 + tw - badge_w, y, th->bar_fg, th->bar_bg, "%s", badge);
     }
 }
 
@@ -2168,7 +2210,7 @@ static int view_top(iview_t *v) {
 
 static void yank_view(iterm_panel_t *panel, iview_t *v) {
     str_t text = {0};
-    int y1, x1, y2, x2, y, x;
+    int y1, x1, y2, x2, y;
     editor_t *editor;
     if (!panel || !v || !v->term || !v->sel_on) return;
     y1 = v->sel_ay;
@@ -2212,6 +2254,7 @@ static void yank_view(iterm_panel_t *panel, iview_t *v) {
     editor = panel->editor;
     if (editor->cut_buffer) free(editor->cut_buffer);
     editor->cut_buffer = text.data;
+    if (tb_width() >= 0) util_clipboard_set(text.data, text.len);
     if (editor->active && editor->active->active_cursor) {
         cursor_t *c = editor->active->active_cursor;
         if (c->cut_buffer) free(c->cut_buffer);
@@ -2298,7 +2341,7 @@ static int copy_key(iterm_panel_t *panel, iview_t *v, struct tb_event *ev) {
         if (v->copy_y < 0) v->copy_y = 0;
         reveal_copy(v);
     } else {
-        MLE_SET_INFO(panel->editor, "copy: arrows move, v select, y yank, q leave");
+        MLE_SET_INFO(panel->editor, "%s", "copy: arrows move, v select, y yank, q leave");
     }
     return 1;
 }
@@ -2443,7 +2486,7 @@ static iterm_t *spawn_term(iterm_panel_t *panel, const char *cmdline) {
     }
     if (!panel->ever_hinted) {
         panel->ever_hinted = 1;
-        MLE_SET_INFO(panel->editor, "terminal  f7 hide   M-t ? commands");
+        MLE_SET_INFO(panel->editor, "%s", "drag the edge to resize   + new shell   x close   f7 hide");
     }
     return t;
 }
@@ -2486,7 +2529,7 @@ static const char *action_from_event(struct tb_event *ev) {
 }
 
 static void action_help(editor_t *editor) {
-    MLE_SET_INFO(editor, "M-t: n new  N cmd  x close  k kill  [ ] tab  o pane  v/s split  w editor  +/- size  b/t/l/r/m dock  y copy  p paste  c clear  R rename  q hide");
+    MLE_SET_INFO(editor, "%s", "drag edge, + new, x close, f7 hide. M-t: n N x k [ ] o v s w + - b t l r m y p c R q");
 }
 
 int iterm_action(editor_t *editor, const char *action) {
@@ -2578,6 +2621,15 @@ int iterm_action(editor_t *editor, const char *action) {
         }
         if (!panel->visible) panel->visible = 1;
         relayout(panel);
+        return MLE_OK;
+    }
+
+    if (strcmp(action, "dockcycle") == 0) {
+        if (panel->dock == DOCK_BOTTOM) panel->dock = DOCK_TOP;
+        else if (panel->dock == DOCK_TOP) panel->dock = DOCK_LEFT;
+        else if (panel->dock == DOCK_LEFT) panel->dock = DOCK_RIGHT;
+        else panel->dock = DOCK_BOTTOM;
+        if (panel->visible) relayout(panel);
         return MLE_OK;
     }
 
@@ -2714,18 +2766,37 @@ int iterm_action(editor_t *editor, const char *action) {
         return MLE_OK;
     }
 
-    if (strcmp(action, "paste") == 0) {
+    if (strcmp(action, "paste") == 0 || strcmp(action, "pasteclip") == 0) {
         char *cut;
+        char *clip;
+        size_t n;
+        int free_clip;
         if (!t || !t->alive) return MLE_OK;
-        cut = editor->cut_buffer;
+        clip = NULL;
+        n = 0;
+        free_clip = 0;
+        cut = NULL;
+        if (strcmp(action, "pasteclip") == 0 && tb_width() >= 0
+            && util_clipboard_get(&clip, &n) == MLE_OK && clip && clip[0]) {
+            cut = clip;
+            free_clip = 1;
+        }
+        if (!cut || !cut[0]) cut = editor->cut_buffer;
+        if ((!cut || !cut[0]) && strcmp(action, "paste") == 0 && tb_width() >= 0
+            && util_clipboard_get(&clip, &n) == MLE_OK && clip && clip[0]) {
+            cut = clip;
+            free_clip = 1;
+        }
         if (!cut || !cut[0]) {
-            MLE_SET_INFO(editor, "terminal: cut buffer is empty");
+            MLE_SET_INFO(editor, "%s", "terminal: nothing to paste");
+            if (free_clip) free(clip);
             return MLE_OK;
         }
         if (panel->focus) panel->focus->scroll = 0;
         if (t->bracket_paste) term_write(t, "\033[200~", 6);
         term_write(t, cut, (int)strlen(cut));
         if (t->bracket_paste) term_write(t, "\033[201~", 6);
+        if (free_clip) free(clip);
         return MLE_OK;
     }
 
@@ -2765,6 +2836,19 @@ int cmd_iterm(cmd_context_t *ctx) {
     if (!ctx || !ctx->editor) return MLE_ERR;
     action = ctx->static_param ? ctx->static_param : "toggle";
     return iterm_action(ctx->editor, action);
+}
+
+int iterm_visible(editor_t *editor) {
+    return editor && editor->iterm && editor->iterm->visible;
+}
+
+int iterm_dragging(editor_t *editor) {
+    return editor && editor->iterm && editor->iterm->visible && editor->iterm->drag;
+}
+
+const char *iterm_dock_name(editor_t *editor) {
+    if (!editor || !editor->iterm) return "bottom";
+    return dock_name(editor->iterm->dock);
 }
 
 int iterm_running(editor_t *editor) {
@@ -2820,7 +2904,7 @@ void iterm_apply_layout(editor_t *editor, bview_rect_t *edit) {
         p->h = edit->h;
     } else if (p->dock == DOCK_BOTTOM || p->dock == DOCK_TOP) {
         int ph, maxh;
-        if (p->size_h < 6) p->size_h = edit->h / 3;
+        if (p->size_h < 1) p->size_h = edit->h / 3;
         if (p->size_h < 6) p->size_h = edit->h > 6 ? 6 : edit->h;
         ph = p->size_h;
         maxh = edit->h - 3;
@@ -2841,8 +2925,8 @@ void iterm_apply_layout(editor_t *editor, bview_rect_t *edit) {
         }
     } else {
         int pw, maxw;
-        if (p->size_w < 20) p->size_w = edit->w / 3;
-        if (p->size_w < 20) p->size_w = edit->w > 20 ? 20 : edit->w;
+        if (p->size_w < 1) p->size_w = edit->w / 3;
+        if (p->size_w < 12) p->size_w = edit->w > 12 ? 12 : edit->w;
         pw = p->size_w;
         maxw = edit->w - 10;
         if (maxw < 16) maxw = edit->w;
@@ -2862,13 +2946,30 @@ void iterm_apply_layout(editor_t *editor, bview_rect_t *edit) {
         }
     }
 
-    tabh = p->h >= 4 ? 1 : 0;
-    p->tabh = tabh;
-    cx = p->x;
-    cy = p->y + tabh;
-    cw = p->w;
-    ch = p->h - tabh;
-    if (ch < 1) ch = p->h;
+    {
+        int edge = 0;
+        p->grip = 0;
+        if (p->dock == DOCK_BOTTOM && p->h >= 5) {
+            p->grip = 1;
+            edge = 1;
+        } else if (p->dock == DOCK_TOP && p->h >= 5) {
+            p->grip = 2;
+            edge = 1;
+        } else if (p->dock == DOCK_LEFT && p->w >= 18) {
+            p->grip = 3;
+        } else if (p->dock == DOCK_RIGHT && p->w >= 18) {
+            p->grip = 4;
+        }
+        tabh = (p->h - edge) >= 4 ? 1 : 0;
+        p->tabh = tabh;
+        p->tab_y = p->y + (p->grip == 1 ? 1 : 0);
+        cx = p->x + (p->grip == 4 ? 1 : 0);
+        cy = p->y + (p->grip == 1 ? 1 : 0) + tabh;
+        cw = p->w - ((p->grip == 3 || p->grip == 4) ? 1 : 0);
+        ch = p->h - edge - tabh;
+    }
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
     if (!p->root) {
         p->root = make_leaf(NULL);
         p->focus = p->root;
@@ -2891,6 +2992,7 @@ void iterm_draw(editor_t *editor) {
         return;
     }
     if (p->w < 1 || p->h < 1) return;
+    draw_grip(p);
     draw_tabs(p);
     draw_view(p, p->root);
     if (p->focused && p->focus && p->focus->copy_mode) {
@@ -2903,7 +3005,16 @@ void iterm_draw(editor_t *editor) {
 static int is_toggle_key(struct tb_event *ev) {
     if (ev->key == TB_KEY_F7 && !(ev->mod & TB_MOD_ALT)) return 1;
     if ((ev->mod & TB_MOD_ALT) && ev->ch == '`') return 1;
+    /* Ctrl+Shift+` / ~ only. Plain Ctrl+Space is the same key with no shift. */
+    if (ev->key == TB_KEY_CTRL_TILDE && (ev->mod & TB_MOD_CTRL) && (ev->mod & TB_MOD_SHIFT)) return 1;
     return 0;
+}
+
+static int is_select_arrow(struct tb_event *ev) {
+    if (!(ev->mod & TB_MOD_SHIFT) || (ev->mod & TB_MOD_CTRL)) return 0;
+    return ev->key == TB_KEY_ARROW_LEFT || ev->key == TB_KEY_ARROW_RIGHT
+        || ev->key == TB_KEY_ARROW_UP || ev->key == TB_KEY_ARROW_DOWN
+        || ev->key == TB_KEY_HOME || ev->key == TB_KEY_END;
 }
 
 int iterm_handle_key(editor_t *editor, struct tb_event *ev) {
@@ -2915,6 +3026,14 @@ int iterm_handle_key(editor_t *editor, struct tb_event *ev) {
     int n;
     if (!editor || !editor->iterm || !ev) return 0;
     panel = editor->iterm;
+    if (editor->active && editor->active->is_menu) return 0;
+    if (editor->prompt) return 0;
+    if ((ev->key == TB_KEY_F1 || ev->key == TB_KEY_F8 || ev->key == TB_KEY_F9 || ev->key == TB_KEY_F10)
+        && !(ev->mod & (TB_MOD_CTRL | TB_MOD_ALT))) {
+        panel->prefix = 0;
+        panel->hint = NULL;
+        return 0;
+    }
     if (!panel->focused || !panel->visible) return 0;
     view = panel->focus;
     t = view ? view->term : NULL;
@@ -2924,7 +3043,7 @@ int iterm_handle_key(editor_t *editor, struct tb_event *ev) {
         panel->hint = NULL;
         act = action_from_event(ev);
         if (act == NULL) {
-            MLE_SET_INFO(editor, "terminal: unknown M-t command (M-t ? lists them)");
+            MLE_SET_INFO(editor, "%s", "terminal: unknown M-t command (M-t ? lists them)");
             return 1;
         }
         if (act[0]) iterm_action(editor, act);
@@ -2941,11 +3060,21 @@ int iterm_handle_key(editor_t *editor, struct tb_event *ev) {
     }
     if ((ev->mod & TB_MOD_ALT) && ev->ch == 't') {
         panel->prefix = 1;
-        panel->hint = "n new  N cmd  x close  [ ] tab  v/s split  w editor  +/- size  y copy  p paste  ? help";
+        panel->hint = NULL;
+        MLE_SET_INFO(editor, "%s", "+ new, x close, drag the edge. M-t ? lists every command");
         return 1;
     }
 
     if (view && view->copy_mode) return copy_key(panel, view, ev);
+
+    if (view && view->term && is_select_arrow(ev)) {
+        if (!view->copy_mode) enter_copy(view);
+        return copy_key(panel, view, ev);
+    }
+    if (ev->key == TB_KEY_INSERT && (ev->mod & TB_MOD_SHIFT) && !(ev->mod & TB_MOD_CTRL)) {
+        iterm_action(editor, "pasteclip");
+        return 1;
+    }
 
     if (ev->key == TB_KEY_PGUP && (ev->mod & TB_MOD_SHIFT) && !(ev->mod & TB_MOD_CTRL)) {
         if (view) {
@@ -2973,7 +3102,7 @@ int iterm_handle_key(editor_t *editor, struct tb_event *ev) {
     if (!t) return 1;
     if (!t->alive) {
         if (ev->key == TB_KEY_ENTER) iterm_action(editor, "close");
-        else MLE_SET_INFO(editor, "terminal exited  enter closes   M-t n new");
+        else MLE_SET_INFO(editor, "%s", "terminal exited. enter or x closes it");
         return 1;
     }
 
@@ -3019,7 +3148,6 @@ static int mouse_tracking(iterm_t *t) {
 int iterm_handle_mouse(editor_t *editor, struct tb_event *ev) {
     iterm_panel_t *panel;
     int inside, x, y;
-    iterm_t *hit_term = NULL;
     iview_t *leaf, *div;
     if (!editor || !editor->iterm || !ev) return 0;
     panel = editor->iterm;
@@ -3028,11 +3156,53 @@ int iterm_handle_mouse(editor_t *editor, struct tb_event *ev) {
     y = ev->y;
     inside = x >= panel->x && y >= panel->y && x < panel->x + panel->w && y < panel->y + panel->h;
 
+    /* Keep resizing after the pointer leaves the panel, same as the explorer. */
+    if (panel->drag) {
+        if (ev->key == TB_KEY_MOUSE_RELEASE) {
+            panel->drag = 0;
+            panel->mouse_down = 0;
+            return 1;
+        }
+        if (ev->key == TB_KEY_MOUSE_LEFT || (ev->mod & TB_MOD_MOTION)) {
+            if (panel->drag == 1) {
+                if (panel->dock == DOCK_BOTTOM) panel->size_h = (panel->y + panel->h) - y;
+                else if (panel->dock == DOCK_TOP) panel->size_h = y - panel->y + 1;
+                else if (panel->dock == DOCK_LEFT) panel->size_w = x - panel->x + 1;
+                else if (panel->dock == DOCK_RIGHT) panel->size_w = (panel->x + panel->w) - x;
+                if (panel->size_h < 6) panel->size_h = 6;
+                if (panel->size_w < 12) panel->size_w = 12;
+                relayout(panel);
+                return 1;
+            }
+            if (panel->drag == 2 && panel->drag_split && panel->drag_split->split) {
+                iview_t *sp = panel->drag_split;
+                if (sp->vertical && sp->w > 1) {
+                    float f = (float)(x - sp->x) / (float)sp->w;
+                    if (f < 0.15f) f = 0.15f;
+                    if (f > 0.85f) f = 0.85f;
+                    sp->factor = f;
+                } else if (sp->h > 1) {
+                    float f = (float)(y - sp->y) / (float)sp->h;
+                    if (f < 0.15f) f = 0.15f;
+                    if (f > 0.85f) f = 0.85f;
+                    sp->factor = f;
+                }
+                relayout(panel);
+                return 1;
+            }
+        }
+    }
+
     if (!inside) {
-        if (panel->focused) set_focused(panel, 0);
-        panel->prefix = 0;
-        panel->mouse_down = 0;
-        panel->drag = 0;
+        if (ev->key == TB_KEY_MOUSE_RELEASE) {
+            panel->mouse_down = 0;
+            return 0;
+        }
+        if (ev->key == TB_KEY_MOUSE_LEFT || ev->key == TB_KEY_MOUSE_RIGHT) {
+            if (panel->focused) set_focused(panel, 0);
+            panel->prefix = 0;
+            panel->mouse_down = 0;
+        }
         return 0;
     }
 
@@ -3055,10 +3225,13 @@ int iterm_handle_mouse(editor_t *editor, struct tb_event *ev) {
     }
 
     if (ev->key == TB_KEY_MOUSE_RELEASE) {
+        iview_t *rel = panel->focus;
         panel->mouse_down = 0;
         panel->drag = 0;
-        if (panel->focus && panel->focus->term && mouse_tracking(panel->focus->term) && !panel->focus->copy_mode) {
-            send_mouse(panel->focus->term, panel->last_btn, x - panel->focus->x + 1, y - panel->focus->y + 1, 1);
+        if (rel && rel->term && mouse_tracking(rel->term) && !rel->copy_mode && !rel->sel_on) {
+            send_mouse(rel->term, panel->last_btn, x - rel->x + 1, y - rel->y + 1, 1);
+        } else if (rel && rel->sel_on && (rel->sel_ax != rel->copy_x || rel->sel_ay != rel->copy_y)) {
+            yank_view(panel, rel);
         }
         return 1;
     }
@@ -3073,17 +3246,32 @@ int iterm_handle_mouse(editor_t *editor, struct tb_event *ev) {
         panel->drag = 0;
         set_focused(panel, 1);
         panel->prefix = 0;
-        if (panel->tabh && y == panel->y) {
+        if (hit_grip(panel, x, y) && ev->key == TB_KEY_MOUSE_LEFT) {
+            panel->drag = 1;
+            return 1;
+        }
+        if (panel->tabh && y == panel->tab_y) {
+            if (panel->plus_w > 0 && x >= panel->plus_x && x < panel->plus_x + panel->plus_w) {
+                iterm_action(editor, "new");
+                return 1;
+            }
+            DL_FOREACH(panel->terms, tab) {
+                if (tab->close_x >= 0 && x == tab->close_x) {
+                    iview_t *owner = leaf_showing(panel->root, tab);
+                    if (owner) panel->focus = owner;
+                    else if (panel->focus && iview_is_leaf(panel->focus)) panel->focus->term = tab;
+                    iterm_action(editor, "close");
+                    return 1;
+                }
+            }
             DL_FOREACH(panel->terms, tab) {
                 if (tab->tab_w > 0 && x >= tab->tab_x && x < tab->tab_x + tab->tab_w) {
                     iview_t *owner = leaf_showing(panel->root, tab);
                     if (owner) panel->focus = owner;
                     else if (panel->focus && iview_is_leaf(panel->focus)) panel->focus->term = tab;
-                    hit_term = tab;
                     break;
                 }
             }
-            if (!hit_term) panel->drag = 1;
             return 1;
         }
         div = split_divider_at(panel->root, x, y);
@@ -3093,6 +3281,12 @@ int iterm_handle_mouse(editor_t *editor, struct tb_event *ev) {
             return 1;
         }
         leaf = leaf_at(panel->root, x, y);
+        if (leaf && ev->key == TB_KEY_MOUSE_MIDDLE
+            && !(leaf->term && mouse_tracking(leaf->term) && !(ev->mod & TB_MOD_SHIFT))) {
+            panel->focus = leaf;
+            iterm_action(editor, "pasteclip");
+            return 1;
+        }
         if (leaf) {
             panel->focus = leaf;
             if (leaf->term && mouse_tracking(leaf->term) && !(ev->mod & TB_MOD_SHIFT) && !leaf->copy_mode) {
@@ -3118,32 +3312,6 @@ int iterm_handle_mouse(editor_t *editor, struct tb_event *ev) {
         return 1;
     }
 
-    if (panel->drag == 1) {
-        if (panel->dock == DOCK_BOTTOM) panel->size_h = (panel->y + panel->h) - y;
-        else if (panel->dock == DOCK_TOP) panel->size_h = y - panel->y + 1;
-        else if (panel->dock == DOCK_LEFT) panel->size_w = x - panel->x + 1;
-        else if (panel->dock == DOCK_RIGHT) panel->size_w = (panel->x + panel->w) - x;
-        if (panel->size_h < 6) panel->size_h = 6;
-        if (panel->size_w < 12) panel->size_w = 12;
-        relayout(panel);
-        return 1;
-    }
-    if (panel->drag == 2 && panel->drag_split && panel->drag_split->split) {
-        iview_t *sp = panel->drag_split;
-        if (sp->vertical && sp->w > 1) {
-            float f = (float)(x - sp->x) / (float)sp->w;
-            if (f < 0.15f) f = 0.15f;
-            if (f > 0.85f) f = 0.85f;
-            sp->factor = f;
-        } else if (sp->h > 1) {
-            float f = (float)(y - sp->y) / (float)sp->h;
-            if (f < 0.15f) f = 0.15f;
-            if (f > 0.85f) f = 0.85f;
-            sp->factor = f;
-        }
-        relayout(panel);
-        return 1;
-    }
     leaf = panel->focus;
     if (leaf && leaf->term && mouse_tracking(leaf->term) && !(ev->mod & TB_MOD_SHIFT) && !leaf->sel_on && (leaf->term->mouse_1002 || (ev->mod & TB_MOD_MOTION))) {
         int btn = panel->last_btn;

@@ -469,10 +469,16 @@ int buffer_insert_w_bline(buffer_t *self, bline_t *start_line, bint_t start_col,
     }
 
     // Get inserted data
-    buffer_substr(self, start_line, start_col, cur_line, cur_col, &ins_data, &ins_data_len, &ins_data_nchars);
+    if (buffer_substr(self, start_line, start_col, cur_line, cur_col, &ins_data, &ins_data_len, &ins_data_nchars) != MLBUF_OK) {
+        return MLBUF_ERR;
+    }
 
     // Add baction
     action = calloc(1, sizeof(baction_t));
+    if (!action) {
+        free(ins_data);
+        return MLBUF_ERR;
+    }
     action->type = MLBUF_BACTION_TYPE_INSERT;
     action->buffer = self;
     action->start_line = start_line;
@@ -530,7 +536,9 @@ int buffer_delete_w_bline(buffer_t *self, bline_t *start_line, bint_t start_col,
     }
 
     // Get deleted data
-    buffer_substr(self, start_line, start_col, end_line, end_col, &del_data, &del_data_len, &del_data_nchars);
+    if (buffer_substr(self, start_line, start_col, end_line, end_col, &del_data, &del_data_len, &del_data_nchars) != MLBUF_OK) {
+        return MLBUF_ERR;
+    }
 
     // Delete suffix starting at start_line:start_col
     MLBUF_BLINE_ENSURE_CHARS(start_line);
@@ -569,6 +577,10 @@ int buffer_delete_w_bline(buffer_t *self, bline_t *start_line, bint_t start_col,
 
     // Add baction
     action = calloc(1, sizeof(baction_t));
+    if (!action) {
+        free(del_data);
+        return MLBUF_ERR;
+    }
     action->type = MLBUF_BACTION_TYPE_DELETE;
     action->buffer = self;
     action->start_line = start_line;
@@ -885,6 +897,12 @@ int buffer_substr(buffer_t *self, bline_t *start_line, bint_t start_col, bline_t
     data_len = 0;
     data_size = 2;
     nchars = 0;
+    if (!data) {
+        *ret_data = NULL;
+        *ret_data_len = 0;
+        *ret_data_nchars = 0;
+        return MLBUF_ERR;
+    }
 
     for (tmp_line = start_line; tmp_line != end_line->next; tmp_line = tmp_line->next) {
         // Get copy_index + copy_len
@@ -916,8 +934,17 @@ int buffer_substr(buffer_t *self, bline_t *start_line, bint_t start_col, bline_t
         // Copy add_len bytes from copy_index into data
         if (add_len > 0) {
             if (data_len + add_len + 1 > data_size) {
+                char *grown;
                 data_size = data_len + add_len + 1; // Plus 1 for nullchar
-                data = realloc(data, data_size);
+                grown = realloc(data, (size_t)data_size);
+                if (!grown) {
+                    free(data);
+                    *ret_data = NULL;
+                    *ret_data_len = 0;
+                    *ret_data_nchars = 0;
+                    return MLBUF_ERR;
+                }
+                data = grown;
             }
             if (copy_len > 0) {
                 memcpy(data + data_len, tmp_line->data + copy_index, copy_len);
@@ -1176,9 +1203,16 @@ int bline_get_col(bline_t *self, bint_t index, bint_t *ret_col) {
 // Convert a vcol to a col
 int bline_get_col_from_vcol(bline_t *bline, bint_t vcol, bint_t *ret_col) {
     bint_t i;
+    bint_t start;
+    bint_t end;
     MLBUF_BLINE_ENSURE_CHARS(bline);
+    if (vcol < 0) vcol = 0;
     for (i = 0; i < bline->char_count; i++) {
-        if (vcol <= bline->chars[i].vcol) {
+        start = bline->chars[i].vcol;
+        if (i + 1 < bline->char_count) end = bline->chars[i + 1].vcol;
+        else end = bline->char_vwidth;
+        if (end <= start) end = start + 1;
+        if (vcol >= start && vcol < end) {
             *ret_col = i;
             return MLBUF_OK;
         }

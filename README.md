@@ -1,18 +1,18 @@
-# mle
+# MLE Code
 
-mle is a small, flexible, terminal-based text editor written in C.
+MLE Code is a small, flexible, terminal-based text editor written in C.
+The command is `mle`.
 
-Runs on Linux, Windows (Cygwin or WSL), FreeBSD, macOS, and more.
+The original editor is [mle](https://github.com/adsr/mle) by **adsr**.
+The C core, the keymap stack, Lua, syntax highlighting, and the 1.8 line
+are that project. **quomy** maintains this tree: the terminal panel, the
+file list, the git sidebar, themes, the symbol sets, and the `dist/` build.
+Other people who patched upstream mle are named in [CHANGELOG.md](CHANGELOG.md).
 
-[![Build Status](https://github.com/adsr/mle/actions/workflows/mle_test.yml/badge.svg)](https://github.com/adsr/mle/actions/workflows/mle_test.yml)
+The license is unchanged. See [LICENSE](LICENSE) (Apache 2.0).
 
-### Demos
-
-[![asciicast](https://i.imgur.com/PZocaOT.png)](https://asciinema.org/a/162536)
-
-* [AceJump-like movement](https://i.imgur.com/atS11HX.gif)
-* [Large file benchmark](http://i.imgur.com/VGGMmGg.gif)
-* [Older demos](http://imgur.com/a/ZBmmQ)
+Runs on Linux, Windows (Cygwin, MSYS2, or WSL), FreeBSD, macOS, and more.
+Per-system commands live in [docs/](docs/README.md).
 
 ### Aims
 
@@ -24,7 +24,7 @@ Runs on Linux, Windows (Cygwin or WSL), FreeBSD, macOS, and more.
 
 ### Features
 
-* Small codebase (~12k SLOC)
+* Small codebase
 * Full UTF-8 support
 * Syntax highlighting
 * Stackable key maps (modes)
@@ -32,6 +32,9 @@ Runs on Linux, Windows (Cygwin or WSL), FreeBSD, macOS, and more.
 * Scriptable rc file
 * Key macros
 * Window splitting
+* Integrated terminal (tabs, splits, scrollback, drag to resize)
+* File list and a git panel with commit, push, pull, and a click-through diff
+* Six color themes, plus themes you name yourself
 * Regex search and replace
 * Large file support
 * Incremental search
@@ -48,32 +51,32 @@ Runs on Linux, Windows (Cygwin or WSL), FreeBSD, macOS, and more.
 
 ### Building
 
-    $ sudo apt install git build-essential # install git, make, gcc, libc-dev
-    $
-    $ git clone --recursive https://github.com/adsr/mle.git
+Editor sources are in `src/`. The binary is `dist/mle`. Object files go to `.cache/`, not the source tree.
+
+    $ git clone --recursive https://github.com/quomy-code/MLE-Code.git
     $ cd mle
     $ make mle_vendor=1
+    $ ./dist/mle
 
-To build a completely static binary, try `make mle_vendor=1 mle_static=1`.
+`mle_vendor=1` builds the bundled Lua 5.5 and PCRE2. That is the build these
+docs use. A static binary is `make mle_vendor=1 mle_static=1`.
 
-You can also run plain `make` to link against system libraries instead of
-`vendor/`. Note this requires the following packages to be installed:
+    $ make test mle_vendor=1
+    $ make install              # /usr/local/bin/mle
+    $ make install prefix=/usr  # /usr/bin/mle
+    $ scripts/dist.sh           # dist/mle-code_<version>_<os>_<arch>
 
-    uthash-dev
-    liblua5.4-dev
-    libpcre2-dev
+`make clean` removes `dist/`, `.cache/`, and stray `.o`, `.bak`, and `.out`
+files. Plain `make` links system `-llua5.5` and `-lpcre2-8` instead. Use it
+only when those headers are installed. Lua 5.4 is not a substitute.
 
-To install to `/usr/local/bin`:
-
-    $ make install
-
-To install to a custom directory, supply `prefix`, e.g.:
-
-    $ make install prefix=/usr # /usr/bin/mle
+Packages, compilers, and the release workflow are in [docs/](docs/README.md):
+Linux, BSD, macOS, and Windows.
 
 ### Installing from a repo
 
-mle may be available to install via your system's package manager.
+Upstream mle may be available via your system's package manager. That package
+is adsr's release, not necessarily this tree.
 
     # apt install mle   # Ubuntu and Debian-based distros
     # dnf install mle   # CentOS, RHEL, Fedora-based distros
@@ -87,8 +90,6 @@ mle may be available to install via your system's package manager.
     # port install mle  # macOS (MacPorts)
     # setup-x86.exe -q -P mle # Cygwin
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/mle.svg)](https://repology.org/project/mle/versions)
-
 ### Basic usage
 
     $ mle               # Open blank buffer
@@ -100,7 +101,7 @@ mle may be available to install via your system's package manager.
 The default key bindings are intuitive. Input text as normal, use directional
 keys to move around, use `Ctrl-S` to save, `Ctrl-O` to open, `Ctrl-X` to exit.
 
-Press `F2` for full help.
+Press `F1` for a short guide and `F2` for full help.
 
 ### Advanced usage: mlerc
 
@@ -109,7 +110,7 @@ options.
 
 To set default options, make an rc file named `~/.mlerc` (or `/etc/mlerc`). The
 contents of the rc file are any number of cli options separated by newlines.
-Lines that begin with a semi-colon are interpretted as comments.
+Lines that begin with a semi-colon are interpreted as comments.
 
 If `~/.mlerc` is executable, mle executes it and interprets the resulting stdout
 as described above. For example, consider the following snippet from an
@@ -146,6 +147,80 @@ Arbitrary shell commands can also be run via `cmd_shell` (`M-e` by default). If
 any text is selected, it is sent to stdin of the command. Any resulting stdout
 is inserted into the text buffer.
 
+### Integrated terminal
+
+`f7` or Alt-grave (the key above Tab) opens a terminal panel on the bottom of
+the window, like the panel in VS Code. Press the same keys to hide it. On a
+terminal that already reports Ctrl+Shift+grave as its own chord (kitty CSI-u,
+or xterm modifyOtherKeys), that chord toggles the panel too. Classic terminals
+cannot tell it from Ctrl+Space, so `f7` remains the reliable key. While the
+panel is focused, keys go to the shell, including `Ctrl-C` and the arrow keys.
+Drag the bar between the editor and the shell to resize the panel. It keeps
+following the pointer after you leave the panel. `+` on the tab row opens
+another shell, and `x` on a tab closes that one. `Alt-t` is still the command
+prefix for everything else (`Alt-t ?` lists every command). `Alt-T` opens
+another terminal.
+
+`Alt-t v` and `Alt-t s` split the panel. `Alt-t b`, `Alt-t t`, `Alt-t l`,
+`Alt-t r`, and `Alt-t m` dock it on the bottom, top, left, right, or over the
+whole edit area. `Shift-PgUp` scrolls the 2000-line history. `Ctrl-PgUp` switches
+tabs. Shift-arrows select text in the panel. `Alt-t y`, or releasing a mouse
+drag, copies the selection into the editor cut buffer and the system clipboard
+(OSC 52, plus `wl-copy` or `xclip` when one of those is installed). `Shift-Insert`
+and middle-click paste the clipboard. `Ctrl-u` pastes the editor cut buffer.
+`Alt-t w` returns focus to the editor and leaves the panel open.
+
+`f8` opens one settings menu: mouse, tabs, syntax, wrap, undo, line numbers,
+the file list, git, the terminal, its dock, the theme, symbols, copy, paste,
+and rebinding any command to a key. Choosing a row applies it and leaves the
+menu open. Escape, or the close row, leaves. Everyday keys are arrows, save,
+open, quit, undo, find, cut, and paste. Every other binding still works; `f2`
+lists them. Mouse selection is on by default; `-e0` turns it off. A drag
+selects each letter under the pointer, including the one you started on.
+Double-click selects a word and triple-click selects a line. Releasing a drag
+copies and leaves the selection on screen. Typing replaces it. The old `M-e`
+shell command is unchanged.
+
+### Files, git, and the status bar
+
+`f9` shows a file list on the left. Click a file to select it. Double-click,
+right-click, or Enter opens it. Click a folder to expand it. Double-click or
+right-click steps into it. Backspace steps up. `/` asks for a folder path, and
+`~` means your home directory. Drag the blue edge to resize the list.
+
+`f10` switches the same panel to git. The line under the branch is the
+GitHub account. If `gh` or `~/.git-credentials` already has one, mle uses
+it. `g`, `[`, `]`, Left, and Right switch accounts. `n` starts a login:
+username, then password. GitHub wants a personal access token in the
+password field. Enter saves that login. `N` forgets a login mle stored.
+The next line is the commit message. Enter or Commit commits it. Push and
+Pull sit on the row under that. Push still asks you to type `yes`. Pull
+runs and shows the result. Click a changed file to open a diff: each block
+starts with `line N` so you can see where it changed, then the added and
+removed lines. Double-click or Enter opens the file. `a` stages, `u`
+unstages, `d` shows that diff again, `l` shows the log. `x` discards one
+file only after you type `yes`. Escape leaves the field, then the list.
+
+`f8` `symbols` cycles four sets compiled into mle: `plain` (ASCII), `marks`
+(arrows and triangles), and two bitmap fonts, `slab` and `line`. Those fonts
+are drawn as braille, so the shape does not depend on the terminal's font.
+
+The status bar names the file, the line and column, the language, and the git
+branch. Click the file name for the buffer list, the line for go-to-line, and
+the branch for the git panel. `f1` opens a short guide. `f2` is still the full
+binding list.
+
+Six themes ship with mle: `mle`, `paper`, `night`, `forest`, `ember`, and
+`ocean`. `f8` cycles them. `newtheme` copies the current theme under a name
+you choose. `painttheme` sets one role, for example `comment bold cyan` or
+`selection white/blue`. Your themes are written to `~/.mle/themes` and loaded
+the next time mle starts. Built-in themes stay as they are; painting one
+copies it first.
+
+Syntax highlighting covers the usual source, web, data, and config languages,
+and a small fallback colors files that do not match a specific pack. Rules are
+PCRE, so opening a file stays cheap.
+
 ### Advanced usage: Headless mode
 
 mle provides support for non-interactive editing which may be useful for using
@@ -166,10 +241,10 @@ a new buffer and then runs as normal in interactive mode.
 
 mle is extensible via the [Lua](https://www.lua.org) programming language.
 Scripts are loaded via the `-x` cli option. Commands registered by scripts can
-be mapped to keys as normal via `-k`. See `uscript.lua` for a simple example.
+be mapped to keys as normal via `-k`. See `src/uscript.lua` for a simple example.
 
 There is also a `wren` branch with [Wren](http://wren.io) scripting support.
-That work is on pause.
+That work is on pause. It belongs to upstream mle.
 
 ### Forks
 

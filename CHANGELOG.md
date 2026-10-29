@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.8.2] - 2026-10-30
+
+### added
+
+- integrated terminal panel with a real PTY, tabs, splits, scrollback, and copy into the editor cut buffer
+- terminal parser consumes OSC titles, bracketed paste, clear, and readline cursor editing
+- F8 settings menu stays open while you change options, with runtime key rebinding, and Ctrl-Shift-grave terminal toggle when the host sends that chord
+- mouse selection includes the letter under the pointer; double-click selects a word, triple-click a line, and release copies without clearing the selection
+- readable status bar: click the file name, the line, or the git branch
+- left-hand file list (F9) with folder switching, and a git panel (F10)
+- short guide on F1
+- syntax packs for many languages, plus a fallback highlighter
+- terminal panel resizes by dragging its edge, with + to open a shell and x to close a tab
+- everyday keys stay in front; every other binding still works and is listed on F2
+- six color themes (mle, paper, night, forest, ember, ocean) plus named themes saved in ~/.mle/themes
+- git panel: type a commit in the list, with Commit, Push, and Pull buttons; clicking a file opens a diff that names each changed line
+- the cursor stays on the line being edited, and prompt and git fields accept any letters, including more than one GitHub account from gh, git, or a username and token
+- four symbol sets compiled into mle (plain, marks, and the slab and line bitmap fonts)
+- build output goes to dist/, and object files go to .cache/
+
+### fixed
+
+- shell and async commands reap their child instead of leaking a zombie, and a failed read no longer writes before the buffer
+- tab completion, grep, ctags, browse, and cut bail out when allocation fails instead of using a null pointer
+
 ## [1.8.1] - 2026-04-11
 
 ### changed

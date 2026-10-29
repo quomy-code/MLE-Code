@@ -1526,6 +1526,14 @@ static struct {
     {"\x1bOD",       TB_KEY_ARROW_LEFT,  TB_MOD_CTRL                            },
     {"\x1b\x1bOD",   TB_KEY_ARROW_LEFT,  TB_MOD_CTRL | TB_MOD_ALT               },
 
+    /* Ctrl+Shift+` and Ctrl+Shift+~ when the host already sends them.
+       Kitty's keyboard protocol is not enabled, so Ctrl+C stays a single byte.
+       mod is CTRL|SHIFT, which does not match plain Ctrl+Space. */
+    {"\x1b[96;6u",      TB_KEY_CTRL_TILDE, TB_MOD_CTRL | TB_MOD_SHIFT           },
+    {"\x1b[126;6u",     TB_KEY_CTRL_TILDE, TB_MOD_CTRL | TB_MOD_SHIFT           },
+    {"\x1b[27;6;96~",   TB_KEY_CTRL_TILDE, TB_MOD_CTRL | TB_MOD_SHIFT           },
+    {"\x1b[27;6;126~",  TB_KEY_CTRL_TILDE, TB_MOD_CTRL | TB_MOD_SHIFT           },
+
     {NULL,           0,                  0                                      },
 };
 
