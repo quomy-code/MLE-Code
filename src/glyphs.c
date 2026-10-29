@@ -2,7 +2,7 @@
 #include <string.h>
 #include "mle.h"
 
-/* Two 8x8 bitmap fonts. Bit 7 of each row is the leftmost pixel.
+/* Three 8x8 bitmap fonts. Bit 7 of each row is the leftmost pixel.
    Each braille cell samples the bitmap in 4x2 blocks (2 dots by 4 dots),
    so the shape on screen is these bits, not whatever the host font drew. */
 
@@ -27,7 +27,16 @@ static const uint8_t font_slab[GLY_COUNT][8] = {
     /* del */    { Z, Z, F, F, F, F, Z, Z },
     /* untrack */{ F, F, R, R, Z, Z, R, R },
     /* rename */ { F, F, L, L, R, R, F, F },
-    /* staged */ { Z, Z, R, R, R, R, Z, Z }
+    /* staged */ { Z, Z, R, R, R, R, Z, Z },
+    /* file */   { F, F, R, R, R, R, F, F },
+    /* refresh */{ R, R, Z, Z, L, L, F, F },
+    /* filter */ { F, F, R, R, R, R, Z, Z },
+    /* search */ { F, F, R, R, Z, Z, R, R },
+    /* conflict*/{ R, R, F, F, R, R, F, F },
+    /* stash */  { F, F, L, L, R, R, F, F },
+    /* fetch */  { R, R, R, R, F, F, Z, Z },
+    /* check */  { L, L, R, R, R, R, L, L },
+    /* log */    { F, F, Z, Z, F, F, Z, Z }
 };
 
 static const uint8_t font_line[GLY_COUNT][8] = {
@@ -46,7 +55,45 @@ static const uint8_t font_line[GLY_COUNT][8] = {
     /* del */    { Z, Z, F, F, Z, Z, Z, Z },
     /* untrack */{ F, F, Z, Z, Z, Z, R, R },
     /* rename */ { F, F, Z, Z, Z, Z, F, F },
-    /* staged */ { Z, Z, R, R, Z, Z, Z, Z }
+    /* staged */ { Z, Z, R, R, Z, Z, Z, Z },
+    /* file */   { F, F, Z, Z, R, R, F, F },
+    /* refresh */{ R, R, Z, Z, L, L, Z, Z },
+    /* filter */ { F, F, Z, Z, R, R, Z, Z },
+    /* search */ { F, F, Z, Z, Z, Z, R, R },
+    /* conflict*/{ R, R, Z, Z, R, R, F, F },
+    /* stash */  { F, F, Z, Z, Z, Z, F, F },
+    /* fetch */  { R, R, Z, Z, F, F, Z, Z },
+    /* check */  { L, L, Z, Z, R, R, L, L },
+    /* log */    { F, F, Z, Z, F, F, Z, Z }
+};
+
+/* A deliberately tiny, quiet font for dense panels. */
+static const uint8_t font_mini[GLY_COUNT][8] = {
+    /* branch */ { L, L, R, R, L, L, R, R },
+    /* open */   { F, F, R, R, Z, Z, Z, Z },
+    /* shut */   { F, F, L, L, Z, Z, Z, Z },
+    /* right */  { Z, Z, R, R, F, F, R, R },
+    /* left */   { Z, Z, L, L, F, F, L, L },
+    /* up */     { R, R, F, F, R, R, Z, Z },
+    /* down */   { Z, Z, R, R, F, F, R, R },
+    /* plus */   { Z, Z, R, R, F, F, R, R },
+    /* close */  { L, L, R, R, L, L, R, R },
+    /* hunk */   { L, L, F, F, R, R, Z, Z },
+    /* mod */    { F, F, Z, Z, F, F, Z, Z },
+    /* add */    { Z, Z, R, R, F, F, R, R },
+    /* del */    { Z, Z, Z, Z, F, F, Z, Z },
+    /* untrack */{ R, R, Z, Z, R, R, Z, Z },
+    /* rename */ { L, L, Z, Z, R, R, Z, Z },
+    /* staged */ { Z, Z, R, R, R, R, Z, Z },
+    /* file */   { F, F, R, R, R, R, F, F },
+    /* refresh */{ R, R, Z, Z, L, L, F, F },
+    /* filter */ { F, F, R, R, Z, Z, Z, Z },
+    /* search */ { F, F, R, R, Z, Z, R, R },
+    /* conflict*/{ R, R, F, F, R, R, Z, Z },
+    /* stash */  { F, F, Z, Z, R, R, F, F },
+    /* fetch */  { R, R, R, R, F, F, Z, Z },
+    /* check */  { L, L, R, R, R, R, Z, Z },
+    /* log */    { F, F, Z, Z, F, F, Z, Z }
 };
 
 #undef Z
@@ -56,7 +103,8 @@ static const uint8_t font_line[GLY_COUNT][8] = {
 
 static const uint32_t plain_cp[GLY_COUNT] = {
     '*', '-', '+', '>', '<', '^', 'v', '+', 'x', '@',
-    'M', 'A', 'D', '?', 'R', '*'
+    'M', 'A', 'D', '?', 'R', '*', '-', 'r', 'f', '/',
+    '!', 's', 'F', '+', 'l'
 };
 
 static const uint32_t marks_cp[GLY_COUNT] = {
@@ -68,7 +116,16 @@ static const uint32_t marks_cp[GLY_COUNT] = {
     0x00D7, /* multiplication sign, close */
     0x00A7, /* section, hunk */
     'M', 'A', 'D', '?', 'R',
-    0x25CF  /* black circle, staged */
+    0x25CF, /* black circle, staged */
+    0x25A1, /* white square, file */
+    0x21BB, /* clockwise open circle arrow, refresh */
+    0x2261, /* identical, filter */
+    0x2315, /* telephone recorder, search */
+    0x203C, /* double exclamation, conflict */
+    0x25A3, /* square containing small square, stash */
+    0x21A7, /* downwards arrow from bar, fetch */
+    0x2713, /* check mark */
+    0x2263  /* strictly equivalent, log */
 };
 
 static int g_pack;
@@ -104,7 +161,8 @@ uint32_t glyphs_cp(int id) {
     if (id < 0 || id >= GLY_COUNT) return (uint32_t)' ';
     if (g_pack <= 0) return plain_cp[id];
     if (g_pack == 1) return marks_cp[id];
-    if (g_pack == 2) return braille_from(font_slab[id]);
+    if (g_pack == 2) return braille_from(font_mini[id]);
+    if (g_pack == 3) return braille_from(font_slab[id]);
     return braille_from(font_line[id]);
 }
 
@@ -134,12 +192,13 @@ int glyphs_utf8(int id, char *dst, int cap) {
 
 const char *glyphs_name(void) {
     if (g_pack == 1) return "marks";
-    if (g_pack == 2) return "slab";
-    if (g_pack >= 3) return "line";
+    if (g_pack == 2) return "mini";
+    if (g_pack == 3) return "slab";
+    if (g_pack >= 4) return "line";
     return "plain";
 }
 
 void glyphs_cycle(void) {
     g_pack += 1;
-    if (g_pack > 3) g_pack = 0;
+    if (g_pack > 4) g_pack = 0;
 }

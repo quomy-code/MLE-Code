@@ -40,6 +40,10 @@ typedef int (*cmd_func_t)(cmd_context_t *ctx); // A command function
 typedef int (*observer_func_t)(char *event_name, void *event_data, void *udata); // An event callback function
 typedef struct uscript_s uscript_t; // A userscript
 typedef struct uhandle_s uhandle_t; // A method handle in a uscript
+typedef struct workspace_s workspace_t; // Sessions, recovery and file metadata
+typedef struct project_tools_s project_tools_t; // Project navigation and tasks
+typedef struct codeintel_s codeintel_t; // Completion, snippets, folding and LSP
+typedef struct git_extra_s git_extra_t; // Line-oriented git tools
 
 // kinput_t
 struct kinput_s {
@@ -142,6 +146,10 @@ struct editor_s {
     int exit_code;
     struct iterm_panel_s *iterm;
     struct side_panel_s *side;
+    workspace_t *workspace;
+    project_tools_t *project_tools;
+    codeintel_t *codeintel;
+    git_extra_t *git_extra;
     int status_file_x;
     int status_file_w;
     int status_git_x;
@@ -195,12 +203,15 @@ struct bview_s {
     bview_rect_t rect_margin_left;
     bview_rect_t rect_buffer;
     bview_rect_t rect_margin_right;
+    bview_rect_t rect_scroll_h;
     buffer_t *buffer;
     bint_t viewport_x;
     bint_t viewport_x_vcol;
     mark_t *viewport_mark;
     int viewport_scope_x;
     int viewport_scope_y;
+    int scroll_drag;
+    int scroll_drag_offset;
     bview_t *split_parent;
     bview_t *split_child;
     float split_factor;
@@ -450,6 +461,7 @@ int editor_get_input(editor_t *editor, loop_context_t *loop_ctx, cmd_context_t *
 int editor_display(editor_t *editor);
 int editor_debug_dump(editor_t *editor, FILE *fp);
 int editor_force_redraw(editor_t *editor);
+int editor_set_active_preserve_viewport(editor_t *editor, bview_t *bview);
 int editor_set_input_mode(editor_t *editor);
 int editor_input_to_key(kinput_t *input, char *keyname);
 int editor_bind(editor_t *editor, char *kmap_name, char *cmd_name, char *key_patt, char *static_param);
@@ -488,13 +500,46 @@ int side_place_cursor(editor_t *editor);
 int side_handle_key(editor_t *editor, struct tb_event *ev);
 int side_handle_mouse(editor_t *editor, struct tb_event *ev);
 int side_action(editor_t *editor, const char *action);
+int side_open_dir(editor_t *editor, const char *path);
 void side_git_label(editor_t *editor, char *buf, size_t n);
 const char *side_guide_text(void);
+int side_debug_parse_git(const char *text, size_t len, char *out, int out_cap);
 int cmd_side(cmd_context_t *ctx);
 int cmd_guide(cmd_context_t *ctx);
 
-/* Symbol packs compiled into the binary. plain is ASCII.
-   marks is Unicode. slab and line are 8x8 bitmap fonts drawn as braille. */
+/* Optional IDE layers. Each module owns its state and commands so the editor
+   core only has lifecycle hooks. All features continue to work without any
+   external program; integrations become richer when rg, ctags, git or an LSP
+   server are available. */
+int workspace_init(editor_t *editor);
+void workspace_shutdown(editor_t *editor);
+void workspace_tick(editor_t *editor);
+void workspace_maybe_welcome(editor_t *editor);
+int workspace_register_commands(editor_t *editor);
+const char *workspace_status(editor_t *editor);
+
+int project_tools_init(editor_t *editor);
+void project_tools_shutdown(editor_t *editor);
+int project_tools_register_commands(editor_t *editor);
+const char *project_tools_root(editor_t *editor);
+
+int codeintel_init(editor_t *editor);
+void codeintel_shutdown(editor_t *editor);
+int codeintel_register_commands(editor_t *editor);
+bline_t *codeintel_next_visible_line(editor_t *editor, bview_t *bview, bline_t *line);
+bline_t *codeintel_screen_line(editor_t *editor, bview_t *bview, bline_t *start, int rows);
+int codeintel_visible_distance(editor_t *editor, bview_t *bview, bline_t *from, bline_t *to);
+char codeintel_fold_mark(editor_t *editor, bview_t *bview, bline_t *line);
+int codeintel_debug_fold_end(buffer_t *buffer, bint_t line, bint_t *end);
+
+int git_extra_init(editor_t *editor);
+void git_extra_shutdown(editor_t *editor);
+int git_extra_register_commands(editor_t *editor);
+char git_extra_line_mark(editor_t *editor, bview_t *bview, bint_t line);
+int git_extra_debug_marks(const char *diff, char *marks, bint_t marks_len);
+
+/* Symbol packs compiled into the binary. plain is ASCII and marks is Unicode.
+   mini, slab, and line are 8x8 bitmap fonts drawn as braille. */
 enum {
     GLY_BRANCH = 0,
     GLY_DIR_OPEN,
@@ -512,6 +557,15 @@ enum {
     GLY_UNTRACK,
     GLY_RENAME,
     GLY_STAGED,
+    GLY_FILE,
+    GLY_REFRESH,
+    GLY_FILTER,
+    GLY_SEARCH,
+    GLY_CONFLICT,
+    GLY_STASH,
+    GLY_FETCH,
+    GLY_CHECK,
+    GLY_LOG,
     GLY_COUNT
 };
 int glyphs_decor(void);
@@ -574,6 +628,9 @@ int bview_resize(bview_t *self, int x, int y, int w, int h);
 int bview_screen_to_bline_col(bview_t *self, int x, int y, bview_t **ret_bview, bline_t **ret_bline, bint_t *ret_col);
 int bview_set_syntax(bview_t *self, char *opt_syntax);
 int bview_set_viewport_y(bview_t *self, bint_t y, int do_rectify);
+int bview_scrollbar_dragging(bview_t *self);
+int bview_handle_scrollbar_mouse(bview_t *self, struct tb_event *ev);
+int bview_debug_scrollbar(int track, bint_t total, bint_t visible, bint_t offset, int *thumb_start, int *thumb_size);
 int bview_split(bview_t *self, int is_vertical, float factor, bview_t **optret_bview);
 int bview_wake_sleeping_cursors(bview_t *self);
 int bview_zero_viewport_y(bview_t *self);

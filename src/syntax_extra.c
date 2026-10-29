@@ -25,7 +25,7 @@ void syntax_extra_init(editor_t *editor) {
         S("'([^'\\\\]|\\\\.)*'", FG_STR),
         S("//.*$", FG_CMT),
         S("^\\s*#.*$", FG_PRE),
-        S("\\b(auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while|bool|class|namespace|template|typename|virtual|public|private|protected|new|delete|this|nullptr|true|false|try|catch|throw|using|constexpr|noexcept)\\b", FG_KW),
+        S("\\b(auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while|bool|class|namespace|template|typename|virtual|public|private|protected|new|delete|this|nullptr|true|false|try|catch|throw|using|constexpr|consteval|constinit|concept|requires|co_await|co_return|co_yield|noexcept|override|final|thread_local|static_assert)\\b", FG_KW),
         S("\\b(-?(0x)?[0-9]+(\\.[0-9]+)?)\\b", FG_NUM),
         SYN_END
     });
@@ -47,7 +47,7 @@ void syntax_extra_init(editor_t *editor) {
         S("'([^'\\\\]|\\\\.)*'", FG_STR),
         S("`[^`]*`", FG_STR),
         S("//.*$", FG_CMT),
-        S("\\b(async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|false|finally|for|from|function|if|import|in|instanceof|let|new|null|return|static|super|switch|this|throw|true|try|typeof|undefined|var|void|while|yield|interface|type|enum|implements|public|private|protected|readonly|as|package)\\b", FG_KW),
+        S("\\b(async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|false|finally|for|from|function|if|import|in|instanceof|let|new|null|return|satisfies|static|super|switch|this|throw|true|try|typeof|undefined|var|void|while|yield|interface|type|enum|implements|keyof|infer|namespace|declare|abstract|public|private|protected|readonly|as|package)\\b", FG_KW),
         S("\\b(-?(0x)?[0-9]+(\\.[0-9]+)?)\\b", FG_NUM),
         SYN_END
     });
@@ -166,7 +166,9 @@ void syntax_extra_init(editor_t *editor) {
         S("\\b(color|background|margin|padding|border|display|flex|grid|position|width|height|font|content|none|auto|absolute|relative|fixed|block|inline|important)\\b", FG_KW),
         SYN_END
     });
-    add(editor, "syn_json", "\\.json$", (srule_def_t[]){
+    add(editor, "syn_json", "\\.(json|jsonc|webmanifest)$", (srule_def_t[]){
+        MM("/\\*", "\\*/", FG_CMT),
+        S("//.*$", FG_CMT),
         S("\"([^\"\\\\]|\\\\.)*\"\\s*:", FG_KW),
         S("\"([^\"\\\\]|\\\\.)*\"", FG_STR),
         S("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?", FG_NUM),
@@ -298,6 +300,76 @@ void syntax_extra_init(editor_t *editor) {
         S("//.*$", FG_CMT),
         S("\\b(abstract|as|assert|async|await|break|case|catch|class|const|continue|covariant|default|deferred|do|dynamic|else|enum|export|extends|extension|external|factory|false|final|finally|for|Function|get|hide|if|implements|import|in|interface|is|late|library|mixin|new|null|on|operator|part|required|rethrow|return|set|show|static|super|switch|sync|this|throw|true|try|typedef|var|void|while|with|yield)\\b", FG_KW),
         S("\\b-?[0-9]+(\\.[0-9]+)?\\b", FG_NUM),
+        SYN_END
+    });
+    add(editor, "syn_powershell", "\\.(ps1|psm1|psd1)$", (srule_def_t[]){
+        MM("<#", "#>", FG_CMT),
+        S("#.*$", FG_CMT),
+        S("\"([^\"\\\\]|\\\\.)*\"", FG_STR),
+        S("'[^']*'", FG_STR),
+        S("\\$[A-Za-z_][A-Za-z0-9_:]*", FG_PRE),
+        S("(?i)\\b(begin|break|catch|class|continue|data|define|do|dynamicparam|else|elseif|end|enum|exit|filter|finally|for|foreach|from|function|if|in|param|process|return|switch|throw|trap|try|until|using|var|while|workflow|true|false|null)\\b", FG_KW),
+        S("\\b-?[0-9]+(\\.[0-9]+)?\\b", FG_NUM),
+        SYN_END
+    });
+    add(editor, "syn_hcl", "\\.(tf|tfvars|hcl)$", (srule_def_t[]){
+        MM("/\\*", "\\*/", FG_CMT),
+        S("#.*$", FG_CMT),
+        S("//.*$", FG_CMT),
+        S("\"([^\"\\\\]|\\\\.)*\"", FG_STR),
+        S("\\$\\{[^}]+\\}", FG_PRE),
+        S("^\\s*\\K[A-Za-z_][A-Za-z0-9_-]*(?=\\s+(\"[^\"]+\"\\s*)?\\{)", FG_KW),
+        S("^\\s*[A-Za-z_][A-Za-z0-9_-]*\\s*=", FG_KW),
+        S("\\b(true|false|null|for|in|if|else)\\b", FG_PRE),
+        S("\\b-?[0-9]+(\\.[0-9]+)?\\b", FG_NUM),
+        SYN_END
+    });
+    add(editor, "syn_graphql", "\\.(graphql|gql)$", (srule_def_t[]){
+        MM("\"\"\"", "\"\"\"", FG_STR),
+        S("#.*$", FG_CMT),
+        S("\"([^\"\\\\]|\\\\.)*\"", FG_STR),
+        S("\\$[A-Za-z_][A-Za-z0-9_]*", FG_PRE),
+        S("\\b(query|mutation|subscription|fragment|on|schema|scalar|type|interface|union|enum|input|directive|extend|implements|true|false|null)\\b", FG_KW),
+        S("@[A-Za-z_][A-Za-z0-9_]*", FG_PRE),
+        S("\\b-?[0-9]+(\\.[0-9]+)?\\b", FG_NUM),
+        SYN_END
+    });
+    add(editor, "syn_nix", "\\.nix$", (srule_def_t[]){
+        MM("/\\*", "\\*/", FG_CMT),
+        S("#.*$", FG_CMT),
+        MM("''", "''", FG_STR),
+        S("\"([^\"\\\\]|\\\\.)*\"", FG_STR),
+        S("\\$\\{[^}]+\\}", FG_PRE),
+        S("\\b(assert|else|if|in|inherit|let|or|rec|then|with|builtins|true|false|null)\\b", FG_KW),
+        S("\\b-?[0-9]+(\\.[0-9]+)?\\b", FG_NUM),
+        SYN_END
+    });
+    add(editor, "syn_ocaml", "\\.(ml|mli)$", (srule_def_t[]){
+        MM("\\(\\*", "\\*\\)", FG_CMT),
+        S("\"([^\"\\\\]|\\\\.)*\"", FG_STR),
+        S("'([^'\\\\]|\\\\.)'", FG_STR),
+        S("\\b(and|as|assert|begin|class|constraint|do|done|downto|else|end|exception|external|false|for|fun|function|functor|if|in|include|inherit|initializer|lazy|let|match|method|module|mutable|new|nonrec|object|of|open|or|private|rec|sig|struct|then|to|true|try|type|val|virtual|when|while|with)\\b", FG_KW),
+        S("\\b-?[0-9]+(\\.[0-9]+)?\\b", FG_NUM),
+        SYN_END
+    });
+    add(editor, "syn_env", "(^|/)\\.env(\\.[A-Za-z0-9_-]+)?$", (srule_def_t[]){
+        S("#.*$", FG_CMT),
+        S("\"([^\"\\\\]|\\\\.)*\"", FG_STR),
+        S("'[^']*'", FG_STR),
+        S("^\\s*(export\\s+)?[A-Za-z_][A-Za-z0-9_]*\\s*=", FG_KW),
+        S("\\$\\{[^}]+\\}", FG_PRE),
+        S("\\$[A-Za-z_][A-Za-z0-9_]*", FG_PRE),
+        SYN_END
+    });
+    add(editor, "syn_gitignore", "(^|/)\\.(gitignore|gitattributes|gitmodules)$", (srule_def_t[]){
+        S("#.*$", FG_CMT),
+        S("^(!|\\*)?[^#].*$", FG_STR),
+        SYN_END
+    });
+    add(editor, "syn_git", "(^|/)(git-rebase-todo|COMMIT_EDITMSG)$", (srule_def_t[]){
+        S("#.*$", FG_CMT),
+        S("^(pick|reword|edit|squash|fixup|exec|break|drop|label|reset|merge|update-ref)\\b", FG_KW),
+        S("\\b[0-9a-f]{7,40}\\b", FG_NUM),
         SYN_END
     });
 }

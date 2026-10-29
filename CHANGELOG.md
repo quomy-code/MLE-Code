@@ -4,10 +4,14 @@
 
 ### added
 
+- modular workspace tools behind F11: command palette, session restore, crash recovery, recent projects, external-change detection, and UTF-8/LF controls
+- project search and previewed replace, task runner, Problems navigation, ctags Outline, completion, snippets, non-destructive folds, bracket diagnostics, and optional language-server adapter
+- Git line gutter, changed-line navigation, side-by-side diff, stage-current-hunk, conflict resolver, and safe create/rename/remove actions in the file panel
 - integrated terminal panel with a real PTY, tabs, splits, scrollback, and copy into the editor cut buffer
 - terminal parser consumes OSC titles, bracketed paste, clear, and readline cursor editing
 - F8 settings menu stays open while you change options, with runtime key rebinding, and Ctrl-Shift-grave terminal toggle when the host sends that chord
 - mouse selection includes the letter under the pointer; double-click selects a word, triple-click a line, and release copies without clearing the selection
+- per-view bottom and right scrollbars support arrows, page clicks, thumb dragging, and split layouts
 - readable status bar: click the file name, the line, or the git branch
 - left-hand file list (F9) with folder switching, and a git panel (F10)
 - short guide on F1
@@ -15,15 +19,23 @@
 - terminal panel resizes by dragging its edge, with + to open a shell and x to close a tab
 - everyday keys stay in front; every other binding still works and is listed on F2
 - six color themes (mle, paper, night, forest, ember, ocean) plus named themes saved in ~/.mle/themes
-- git panel: type a commit in the list, with Commit, Push, and Pull buttons; clicking a file opens a diff that names each changed line
+- git panel: type a commit in the list, with Commit, Push, Pull, and Fetch buttons; clicking a file opens a diff that names each changed line
 - the cursor stays on the line being edited, and prompt and git fields accept any letters, including more than one GitHub account from gh, git, or a username and token
-- four symbol sets compiled into mle (plain, marks, and the slab and line bitmap fonts)
+- five symbol sets compiled into mle: plain, marks, and the mini, slab, and line bitmap fonts, with icons for files, filters, conflicts, stashes, fetch, refresh, search, checks, and logs
+- Git status labels and filters, stage/unstage-all, fetch, stash, branch list, graph log, and whole-tree diff stats
+- Git path search, branch switch/create, tags, remotes, worktrees, stash list, file history, and blame
+- syntax packs for PowerShell, Terraform/HCL, GraphQL, Nix, OCaml, dotenv, and Git control files
 - build output goes to dist/, and object files go to .cache/
 
 ### fixed
 
+- clicking text after scrollbar navigation keeps the scrolled viewport and targets the visible line instead of jumping back to the old cursor
 - shell and async commands reap their child instead of leaking a zombie, and a failed read no longer writes before the buffer
 - tab completion, grep, ctags, browse, and cut bail out when allocation fails instead of using a null pointer
+- Git status handles spaces, renames, conflicts, detached heads, ahead/behind counts, and stashes through porcelain v2
+- Git commit success uses the command exit status, and SSH push/pull no longer requires a stored GitHub login
+- side-panel lists and command capture preserve their old allocation on out-of-memory paths and keep draining truncated command output
+- incremental builds now track header dependencies instead of linking stale objects after a structure changes
 
 ## [1.8.1] - 2026-04-11
 

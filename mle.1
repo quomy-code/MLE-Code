@@ -47,17 +47,30 @@ Mouse selection defaults to on; disable it with
 or `M-o m`.
 Drag selects the letters under the pointer. Double-click selects a word and
 triple-click selects a line.
+Each editor view has a horizontal scrollbar at the bottom and a vertical one
+at the right. Click their arrows or tracks, or drag the thumbs.
 `F9` toggles the file list on the left. `/` asks for a folder.
 `F10` toggles git status in that list. The line under the branch is the
 GitHub account. If gh or git already has one, mle uses it. `g`, `[`, `]`,
 Left, and Right switch accounts. `n` starts a login. Type a username, then
 a password or a GitHub personal access token. `N` forgets a login stored
-by mle. The next line is the commit message. Commit, Push, and Pull are
-buttons. Click a file to see what changed and which line. Push and discard
-ask you to type yes. Pull does not. Escape leaves the field, then the list.
-`F8` symbols cycles plain, marks, and two bitmap fonts built into mle.
+by mle. The next line is the commit message. Commit, Push, Pull, and Fetch are
+buttons. Click a file to see what changed and which line. Status labels replace
+raw git codes; `f`, or a click on the branch row, filters them, and `/` searches
+changed paths. `a` and `u`
+stage or unstage one file, while `A` and `U` apply to all files. `d` shows one
+diff, `D` the full stat, `l` the log, and `L` its graph. `b` lists branches,
+`B` switches, and `C` creates one. `t` lists tags, `T` creates one, `R` shows
+remotes, and `w` lists worktrees. `h` shows a file's history, `v` shows blame,
+and `i` lists stashes. `s` stashes, `S` pops, and `F` fetches. Push and discard ask you to type yes.
+Pull does not. SSH remotes do not require an mle login. Escape leaves the
+field, then the list.
+`F8` symbols cycles plain, marks, and three bitmap fonts built into mle.
 `F1` opens a short guide. The status bar shows the file, the cursor, and the
 branch. Click those fields to list buffers, jump to a line, or open git.
+`F11` opens a searchable command palette for project search and replace,
+tasks, Problems, Outline, completion, snippets, folding, sessions, recovery,
+file format controls, language-server actions, and line-oriented Git tools.
 Everyday keys are arrows, Ctrl-S, Ctrl-O, Ctrl-X, Ctrl-Z, Ctrl-F, Ctrl-K,
 and Ctrl-U. Every other binding still works. `F2` lists them.
 `F8` also cycles six themes (mle, paper, night, forest, ember, ocean).

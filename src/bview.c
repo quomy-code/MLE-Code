@@ -18,6 +18,7 @@ static void _bview_draw_prompt(bview_t *self);
 static void _bview_draw_status(bview_t *self);
 static void _bview_draw_edit(bview_t *self, int x, int y, int w, int h);
 static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t **optret_bline, int *optret_rect_y);
+static void _bview_draw_scrollbars(bview_t *self);
 static void _bview_highlight_bracket_pair(bview_t *self, mark_t *mark);
 static bint_t _bview_get_viewport_x(bview_t *self, bline_t *bline);
 static int _bview_is_cursor_line(bview_t *self, bline_t *bline);
@@ -85,6 +86,8 @@ int bview_destroy(bview_t *self) {
 // Move and resize a bview to the given position and dimensions
 int bview_resize(bview_t *self, int x, int y, int w, int h) {
     int aw, ah;
+    int body_h;
+    int has_scroll;
 
     self->x = x;
     self->y = y;
@@ -103,6 +106,9 @@ int bview_resize(bview_t *self, int x, int y, int w, int h) {
     }
 
     if (MLE_BVIEW_IS_EDIT(self)) {
+        has_scroll = ah >= 3;
+        body_h = ah - 1 - (has_scroll ? 1 : 0);
+        if (body_h < 0) body_h = 0;
         self->rect_caption.x = x;
         self->rect_caption.y = y;
         self->rect_caption.w = aw;
@@ -111,27 +117,33 @@ int bview_resize(bview_t *self, int x, int y, int w, int h) {
         self->rect_lines.x = x;
         self->rect_lines.y = y + 1;
         self->rect_lines.w = self->linenum_width;
-        self->rect_lines.h = ah - 1;
+        self->rect_lines.h = body_h;
 
         self->rect_margin_left.x = x + self->linenum_width;
         self->rect_margin_left.y = y + 1;
         self->rect_margin_left.w = 1;
-        self->rect_margin_left.h = ah - 1;
+        self->rect_margin_left.h = body_h;
 
         self->rect_buffer.x = x + self->linenum_width + 1;
         self->rect_buffer.y = y + 1;
         self->rect_buffer.w = MLE_MAX(1, aw - (self->linenum_width + 1 + 1));
-        self->rect_buffer.h = ah - 1;
+        self->rect_buffer.h = body_h;
 
         self->rect_margin_right.x = x + (aw - 1);
         self->rect_margin_right.y = y + 1;
         self->rect_margin_right.w = 1;
-        self->rect_margin_right.h = ah - 1;
+        self->rect_margin_right.h = body_h;
+
+        self->rect_scroll_h.x = self->rect_buffer.x;
+        self->rect_scroll_h.y = y + ah - 1;
+        self->rect_scroll_h.w = MLE_MAX(1, aw - (self->linenum_width + 1));
+        self->rect_scroll_h.h = has_scroll ? 1 : 0;
     } else {
         self->rect_buffer.x = x;
         self->rect_buffer.y = y;
         self->rect_buffer.w = aw;
         self->rect_buffer.h = ah;
+        self->rect_scroll_h.h = 0;
     }
 
     if (self->split_child) {
@@ -948,6 +960,12 @@ static void _bview_draw_status(bview_t *self) {
         x += n;
     }
 
+    n = snprintf(chunk, sizeof(chunk), " %s ", workspace_status(editor));
+    if (workspace_status(editor)[0] && n > 0 && x + n < editor->rect_status.w) {
+        tb_print(x, editor->rect_status.y, classic ? TB_BLACK : th->muted_fg, classic ? TB_WHITE : th->muted_bg, chunk);
+        x += n;
+    }
+
     git[0] = '\0';
     side_git_label(editor, git, sizeof(git));
     if (git[0]) {
@@ -1022,7 +1040,6 @@ static void _bview_draw_edit(bview_t *self, int x, int y, int w, int h) {
     int fg_attr;
     int bg_attr;
     bline_t *bline;
-    bint_t viewport_y;
 
     // Handle split
     if (self->split_child) {
@@ -1082,10 +1099,9 @@ static void _bview_draw_edit(bview_t *self, int x, int y, int w, int h) {
     }
 
     // Render lines and margins
-    bline = self->viewport_mark->bline;
-    viewport_y = bline->line_index;
+    bline = codeintel_screen_line(self->editor, self, self->viewport_mark->bline, 0);
     for (rect_y = 0; rect_y < self->rect_buffer.h; rect_y++) {
-        if (viewport_y + rect_y < 0 || viewport_y + rect_y >= self->buffer->line_count) {
+        if (!bline) {
             // Draw pre/post blank
             mle_theme_t *th = theme_current(self->editor);
             int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
@@ -1098,9 +1114,244 @@ static void _bview_draw_edit(bview_t *self, int x, int y, int w, int h) {
         } else {
             // Draw bline at self->rect_buffer self->viewport_mark + rect_y
             _bview_draw_bline(self, bline, rect_y, &bline, &rect_y);
-            bline = bline->next;
+            bline = codeintel_next_visible_line(self->editor, self, bline);
         }
     }
+    _bview_draw_scrollbars(self);
+}
+
+static int _bview_scrollbar_thumb(int track, bint_t total, bint_t visible, bint_t offset, int *thumb_start, int *thumb_size) {
+    bint_t max_offset;
+    int size;
+    int start;
+    if (!thumb_start || !thumb_size || track < 1) return MLE_ERR;
+    if (visible < 1) visible = 1;
+    if (total < visible) total = visible;
+    max_offset = total - visible;
+    if (offset < 0) offset = 0;
+    if (offset > max_offset) offset = max_offset;
+    size = max_offset > 0 ? (int)(((bint_t)track * visible) / total) : track;
+    if (size < 1) size = 1;
+    if (size > track) size = track;
+    start = max_offset > 0 && track > size
+        ? (int)(((bint_t)(track - size) * offset) / max_offset)
+        : 0;
+    *thumb_start = start;
+    *thumb_size = size;
+    return MLE_OK;
+}
+
+int bview_debug_scrollbar(int track, bint_t total, bint_t visible, bint_t offset, int *thumb_start, int *thumb_size) {
+    return _bview_scrollbar_thumb(track, total, visible, offset, thumb_start, thumb_size);
+}
+
+static bint_t _bview_horizontal_total(bview_t *self) {
+    bline_t *bline;
+    bint_t total;
+    if (!self || !self->active_cursor || !self->active_cursor->mark) return 1;
+    bline = self->active_cursor->mark->bline;
+    MLBUF_BLINE_ENSURE_CHARS(bline);
+    total = bline->char_vwidth + 1;
+    if (total < self->rect_buffer.w) total = self->rect_buffer.w;
+    return total;
+}
+
+static void _bview_set_viewport_x_vcol(bview_t *self, bint_t x) {
+    bline_t *bline;
+    bint_t max_x;
+    if (!self || !self->active_cursor || !self->active_cursor->mark) return;
+    bline = self->active_cursor->mark->bline;
+    MLBUF_BLINE_ENSURE_CHARS(bline);
+    max_x = _bview_horizontal_total(self) - self->rect_buffer.w;
+    if (max_x < 0) max_x = 0;
+    if (x < 0) x = 0;
+    if (x > max_x) x = max_x;
+    self->viewport_x_vcol = x;
+    bline_get_col_from_vcol(bline, x, &self->viewport_x);
+}
+
+static void _bview_set_scroll_y(bview_t *self, bint_t y) {
+    bint_t max_y;
+    if (!self || !self->buffer) return;
+    max_y = self->buffer->line_count - self->rect_buffer.h;
+    if (max_y < 0) max_y = 0;
+    if (y < 0) y = 0;
+    if (y > max_y) y = max_y;
+    bview_set_viewport_y(self, y, 0);
+}
+
+static void _bview_draw_scrollbars(bview_t *self) {
+    mle_theme_t *th;
+    int classic;
+    uint16_t track_fg;
+    uint16_t track_bg;
+    uint16_t thumb_fg;
+    uint16_t thumb_bg;
+    uint32_t htrack;
+    uint32_t vtrack;
+    uint32_t thumb;
+    int i;
+    int start;
+    int size;
+    int track;
+    bint_t total;
+    if (!self || self->rect_scroll_h.h < 1 || self->rect_buffer.h < 1) return;
+    th = theme_current(self->editor);
+    classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
+    track_fg = classic ? TB_WHITE : th->muted_fg;
+    track_bg = classic ? TB_BLACK : th->muted_bg;
+    thumb_fg = classic ? (TB_WHITE | TB_BOLD) : th->accent_fg;
+    thumb_bg = classic ? TB_BLUE : th->accent_bg;
+    htrack = glyphs_decor() ? 0x2500 : (uint32_t)'-';
+    vtrack = glyphs_decor() ? 0x2502 : (uint32_t)'|';
+    thumb = glyphs_decor() ? 0x2588 : (uint32_t)'#';
+
+    for (i = self->x; i < self->rect_scroll_h.x; i++) {
+        tb_set_cell(i, self->rect_scroll_h.y, ' ', track_fg, track_bg);
+    }
+    for (i = 0; i < self->rect_scroll_h.w; i++) {
+        tb_set_cell(self->rect_scroll_h.x + i, self->rect_scroll_h.y, htrack, track_fg, track_bg);
+    }
+    if (self->rect_scroll_h.w >= 2) {
+        tb_set_cell(self->rect_scroll_h.x, self->rect_scroll_h.y,
+            glyphs_decor() ? glyphs_cp(GLY_LEFT) : (uint32_t)'<', thumb_fg, track_bg);
+        tb_set_cell(self->rect_scroll_h.x + self->rect_scroll_h.w - 1, self->rect_scroll_h.y,
+            glyphs_decor() ? glyphs_cp(GLY_RIGHT) : (uint32_t)'>', thumb_fg, track_bg);
+    }
+    track = self->rect_scroll_h.w - 2;
+    if (track > 0) {
+        total = _bview_horizontal_total(self);
+        _bview_scrollbar_thumb(track, total, self->rect_buffer.w, self->viewport_x_vcol, &start, &size);
+        for (i = 0; i < size; i++) {
+            tb_set_cell(self->rect_scroll_h.x + 1 + start + i, self->rect_scroll_h.y, thumb, thumb_fg, thumb_bg);
+        }
+    }
+
+    for (i = 0; i < self->rect_margin_right.h; i++) {
+        tb_set_cell(self->rect_margin_right.x, self->rect_margin_right.y + i, vtrack, track_fg, track_bg);
+    }
+    if (self->rect_margin_right.h >= 2) {
+        tb_set_cell(self->rect_margin_right.x, self->rect_margin_right.y,
+            glyphs_decor() ? glyphs_cp(GLY_UP) : (uint32_t)'^', thumb_fg, track_bg);
+        tb_set_cell(self->rect_margin_right.x, self->rect_margin_right.y + self->rect_margin_right.h - 1,
+            glyphs_decor() ? glyphs_cp(GLY_DOWN) : (uint32_t)'v', thumb_fg, track_bg);
+    }
+    track = self->rect_margin_right.h - 2;
+    if (track > 0) {
+        _bview_scrollbar_thumb(track, self->buffer->line_count, self->rect_buffer.h,
+            self->viewport_mark->bline->line_index, &start, &size);
+        for (i = 0; i < size; i++) {
+            tb_set_cell(self->rect_margin_right.x, self->rect_margin_right.y + 1 + start + i, thumb, thumb_fg, thumb_bg);
+        }
+    }
+}
+
+static void _bview_drag_scrollbar(bview_t *self, int pos) {
+    int track;
+    int start;
+    int size;
+    int thumb_pos;
+    bint_t max_offset;
+    bint_t offset;
+    bint_t total;
+    bint_t visible;
+    if (self->scroll_drag == 1) {
+        track = self->rect_scroll_h.w - 2;
+        total = _bview_horizontal_total(self);
+        visible = self->rect_buffer.w;
+        pos -= self->rect_scroll_h.x + 1;
+    } else {
+        track = self->rect_margin_right.h - 2;
+        total = self->buffer->line_count;
+        visible = self->rect_buffer.h;
+        pos -= self->rect_margin_right.y + 1;
+    }
+    if (track < 1) return;
+    _bview_scrollbar_thumb(track, total, visible,
+        self->scroll_drag == 1 ? self->viewport_x_vcol : self->viewport_mark->bline->line_index,
+        &start, &size);
+    thumb_pos = pos - self->scroll_drag_offset;
+    if (thumb_pos < 0) thumb_pos = 0;
+    if (thumb_pos > track - size) thumb_pos = track - size;
+    max_offset = total > visible ? total - visible : 0;
+    offset = max_offset > 0 && track > size
+        ? ((bint_t)thumb_pos * max_offset + (track - size) / 2) / (track - size)
+        : 0;
+    if (self->scroll_drag == 1) _bview_set_viewport_x_vcol(self, offset);
+    else _bview_set_scroll_y(self, offset);
+}
+
+int bview_scrollbar_dragging(bview_t *self) {
+    if (!self) return 0;
+    if (self->scroll_drag) return 1;
+    return self->split_child ? bview_scrollbar_dragging(self->split_child) : 0;
+}
+
+int bview_handle_scrollbar_mouse(bview_t *self, struct tb_event *ev) {
+    int horizontal;
+    int pos;
+    int first;
+    int last;
+    int track;
+    int start;
+    int size;
+    bint_t offset;
+    bint_t total;
+    bint_t visible;
+    if (!self || !ev || !MLE_BVIEW_IS_EDIT(self)) return 0;
+    if (self->scroll_drag) {
+        if (ev->key == TB_KEY_MOUSE_RELEASE) {
+            self->scroll_drag = 0;
+            self->scroll_drag_offset = 0;
+            return 1;
+        }
+        if (ev->key == TB_KEY_MOUSE_LEFT) {
+            _bview_drag_scrollbar(self, self->scroll_drag == 1 ? ev->x : ev->y);
+            return 1;
+        }
+        return 1;
+    }
+    if (self->split_child && bview_handle_scrollbar_mouse(self->split_child, ev)) return 1;
+    if (ev->key != TB_KEY_MOUSE_LEFT || self->rect_scroll_h.h < 1) return 0;
+    horizontal = ev->y == self->rect_scroll_h.y
+        && ev->x >= self->rect_scroll_h.x
+        && ev->x < self->rect_scroll_h.x + self->rect_scroll_h.w;
+    if (!horizontal && !(ev->x == self->rect_margin_right.x
+        && ev->y >= self->rect_margin_right.y
+        && ev->y < self->rect_margin_right.y + self->rect_margin_right.h)) return 0;
+    editor_set_active_preserve_viewport(self->editor, self);
+    if (horizontal) {
+        pos = ev->x;
+        first = self->rect_scroll_h.x;
+        last = first + self->rect_scroll_h.w - 1;
+        total = _bview_horizontal_total(self);
+        visible = self->rect_buffer.w;
+        offset = self->viewport_x_vcol;
+        track = self->rect_scroll_h.w - 2;
+    } else {
+        pos = ev->y;
+        first = self->rect_margin_right.y;
+        last = first + self->rect_margin_right.h - 1;
+        total = self->buffer->line_count;
+        visible = self->rect_buffer.h;
+        offset = self->viewport_mark->bline->line_index;
+        track = self->rect_margin_right.h - 2;
+    }
+    if (pos == first) offset -= horizontal ? 4 : 1;
+    else if (pos == last) offset += horizontal ? 4 : 1;
+    else if (track > 0) {
+        _bview_scrollbar_thumb(track, total, visible, offset, &start, &size);
+        pos -= first + 1;
+        if (pos >= start && pos < start + size) {
+            self->scroll_drag = horizontal ? 1 : 2;
+            self->scroll_drag_offset = pos - start;
+            return 1;
+        }
+        offset += pos < start ? -visible : visible;
+    }
+    if (horizontal) _bview_set_viewport_x_vcol(self, offset);
+    else _bview_set_scroll_y(self, offset);
+    return 1;
 }
 
 static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t **optret_bline, int *optret_rect_y) {
@@ -1155,7 +1406,13 @@ static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t
         int mfg = classic ? 0 : th->muted_fg;
         int mbg = classic ? 0 : th->text_bg;
         if (!classic && self->editor->hl_line && is_cursor_line && !self->is_menu) mbg = th->line_bg;
-        tb_printf_rect(self->rect_margin_left, 0, rect_y, mfg, mbg, "%c", viewport_x > 0 && bline->char_count > 0 ? '^' : ' ');
+        {
+            char mark = codeintel_fold_mark(self->editor, self, bline);
+            char git_mark = git_extra_line_mark(self->editor, self, bline->line_index);
+            if (git_mark != ' ') mark = git_mark;
+            if (viewport_x > 0 && bline->char_count > 0) mark = '^';
+            tb_printf_rect(self->rect_margin_left, 0, rect_y, mfg, mbg, "%c", mark);
+        }
         if (!is_soft_wrapped && bline->char_vwidth - viewport_x_vcol > self->rect_buffer.w) {
             tb_printf_rect(self->rect_margin_right, 0, rect_y, mfg, mbg, "%c", '$');
         }
@@ -1292,21 +1549,23 @@ int bview_get_screen_coords(bview_t *self, mark_t *mark, int *ret_x, int *ret_y,
     int screen_y;
     int is_soft_wrapped;
     bint_t viewport_x;
+    bline_t *viewport_line;
 
     MLBUF_BLINE_ENSURE_CHARS(mark->bline);
 
     is_soft_wrapped = _bview_is_soft_wrapped(self, mark->bline);
 
+    viewport_line = codeintel_screen_line(self->editor, self, self->viewport_mark->bline, 0);
     if (is_soft_wrapped) {
         screen_x = self->rect_buffer.x + MLE_MARK_COL_TO_VCOL(mark) % self->rect_buffer.w;
-        screen_y = self->rect_buffer.y + (mark->bline->line_index - self->viewport_mark->bline->line_index) + (MLE_MARK_COL_TO_VCOL(mark) / self->rect_buffer.w);
+        screen_y = self->rect_buffer.y + codeintel_visible_distance(self->editor, self, viewport_line, mark->bline) + (MLE_MARK_COL_TO_VCOL(mark) / self->rect_buffer.w);
     } else {
         viewport_x = _bview_get_viewport_x(self, mark->bline);
         screen_x = self->rect_buffer.x + MLE_MARK_COL_TO_VCOL(mark) - MLE_COL_TO_VCOL(mark->bline, viewport_x);
-        screen_y = self->rect_buffer.y + (mark->bline->line_index - self->viewport_mark->bline->line_index);
+        screen_y = self->rect_buffer.y + codeintel_visible_distance(self->editor, self, viewport_line, mark->bline);
     }
-    if (screen_x < self->rect_buffer.x || screen_x > self->rect_buffer.x + self->rect_buffer.w
-       || screen_y < self->rect_buffer.y || screen_y > self->rect_buffer.y + self->rect_buffer.h
+    if (screen_x < self->rect_buffer.x || screen_x >= self->rect_buffer.x + self->rect_buffer.w
+       || screen_y < self->rect_buffer.y || screen_y >= self->rect_buffer.y + self->rect_buffer.h
     ) {
         // Out of bounds
         return MLE_ERR;
@@ -1321,7 +1580,7 @@ int bview_get_screen_coords(bview_t *self, mark_t *mark, int *ret_x, int *ret_y,
 
 // Find bline col given a screen coordinate
 int bview_screen_to_bline_col(bview_t *self, int x, int y, bview_t **ret_bview, bline_t **ret_bline, bint_t *ret_col) {
-    bint_t line_index, vcol;
+    bint_t vcol;
     *ret_bview = NULL;
     *ret_bline = NULL;
     *ret_col = 0;
@@ -1330,8 +1589,7 @@ int bview_screen_to_bline_col(bview_t *self, int x, int y, bview_t **ret_bview, 
         && y >= self->rect_buffer.y
         && y < self->rect_buffer.y + self->rect_buffer.h
     ) {
-        line_index = self->viewport_mark->bline->line_index + (y - self->rect_buffer.y);
-        buffer_get_bline_w_hint(self->buffer, line_index, self->viewport_mark->bline, ret_bline);
+        *ret_bline = codeintel_screen_line(self->editor, self, self->viewport_mark->bline, y - self->rect_buffer.y);
         if (*ret_bline) {
             vcol = _bview_get_viewport_x(self, *ret_bline) + (x - self->rect_buffer.x);
             bline_get_col_from_vcol(*ret_bline, vcol, ret_col);
@@ -1347,14 +1605,12 @@ int bview_screen_to_bline_col(bview_t *self, int x, int y, bview_t **ret_bview, 
 
 
 static bint_t _bview_get_viewport_x(bview_t *self, bline_t *bline) {
-    // Use viewport_x only when
-    // - vwidth >= buffer width (gte not gt to leave room for cursor)
-    // - rendering current line
-    // - not soft wrapping
-    return bline->char_vwidth >= self->rect_buffer.w
-        && _bview_is_cursor_line(self, bline)
-        && !_bview_is_soft_wrapped(self, bline)
-        ? self->viewport_x : 0;
+    bint_t col;
+    if (!self || !bline || self->viewport_x_vcol < 1 || _bview_is_soft_wrapped(self, bline)) return 0;
+    MLBUF_BLINE_ENSURE_CHARS(bline);
+    col = 0;
+    bline_get_col_from_vcol(bline, self->viewport_x_vcol, &col);
+    return col;
 }
 
 static int _bview_is_cursor_line(bview_t *self, bline_t *bline) {

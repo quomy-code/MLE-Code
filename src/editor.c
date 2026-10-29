@@ -163,6 +163,10 @@ int editor_init(editor_t *editor, int argc, char **argv) {
         _editor_init_bviews(editor, argc, argv);
 
         side_init(editor);
+        workspace_init(editor);
+        project_tools_init(editor);
+        codeintel_init(editor);
+        git_extra_init(editor);
 
         // Init startup macro
         _editor_init_headless_mode(editor);
@@ -184,6 +188,7 @@ int editor_run(editor_t *editor) {
     loop_context_t loop_ctx;
     memset(&loop_ctx, 0, sizeof(loop_context_t));
     _editor_resize(editor, -1, -1);
+    workspace_maybe_welcome(editor);
     if (editor->debug_key_input) {
         return _editor_debug_key_input();
     }
@@ -200,6 +205,10 @@ int editor_run(editor_t *editor) {
 // Deinit editor
 int editor_deinit(editor_t *editor) {
     bview_t *bview;
+    git_extra_shutdown(editor);
+    codeintel_shutdown(editor);
+    project_tools_shutdown(editor);
+    workspace_shutdown(editor);
     iterm_shutdown(editor);
     side_shutdown(editor);
     bview_t *bview_tmp1;
@@ -437,7 +446,7 @@ int editor_close_bview(editor_t *editor, bview_t *bview, int *optret_num_closed)
 }
 
 // Set the active bview
-int editor_set_active(editor_t *editor, bview_t *bview) {
+static int _editor_set_active(editor_t *editor, bview_t *bview, int rectify_viewport) {
     if (!_editor_bview_exists(editor, bview)) {
         MLE_RETURN_ERR(editor, "No bview %p in editor->all_bviews", (void*)bview);
     } else if (editor->prompt && editor->prompt != bview) {
@@ -449,8 +458,16 @@ int editor_set_active(editor_t *editor, bview_t *bview) {
         editor->active_edit = bview;
         editor->active_edit_root = bview_get_split_root(bview);
     }
-    bview_rectify_viewport(bview);
+    if (rectify_viewport) bview_rectify_viewport(bview);
     return MLE_OK;
+}
+
+int editor_set_active(editor_t *editor, bview_t *bview) {
+    return _editor_set_active(editor, bview, 1);
+}
+
+int editor_set_active_preserve_viewport(editor_t *editor, bview_t *bview) {
+    return _editor_set_active(editor, bview, 0);
 }
 
 // Print debug info
@@ -940,6 +957,8 @@ static void _editor_loop(editor_t *editor, loop_context_t *loop_ctx) {
         // Set loop_ctx
         editor->loop_ctx = loop_ctx;
 
+        workspace_tick(editor);
+
         // Display editor
         if (!editor->is_display_disabled) {
             editor_display(editor);
@@ -1415,6 +1434,12 @@ static void _editor_get_user_input(editor_t *editor, cmd_context_t *ctx) {
                 editor_display(editor);
                 continue;
             }
+            if (bview_scrollbar_dragging(editor->active_edit_root)
+                && bview_handle_scrollbar_mouse(editor->active_edit_root, &ev)
+            ) {
+                editor_display(editor);
+                continue;
+            }
             if (side_handle_mouse(editor, &ev)) {
                 editor_display(editor);
                 continue;
@@ -1675,6 +1700,16 @@ static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
     int in_gutter;
     long now;
 
+    root = editor->active_edit_root;
+    if (!root && editor->active && MLE_BVIEW_IS_EDIT(editor->active)) {
+        root = bview_get_split_root(editor->active);
+    }
+    if (bview_handle_scrollbar_mouse(root, ev)) {
+        editor->is_mousedown = 0;
+        m_btn = 0;
+        m_bview = NULL;
+        return;
+    }
     if (ev->y == editor->rect_status.y && ev->key == TB_KEY_MOUSE_LEFT) {
         editor->is_mousedown = 0;
         m_btn = 0;
@@ -1683,14 +1718,12 @@ static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
         return;
     }
     if (ev->key == TB_KEY_MOUSE_WHEEL_UP || ev->key == TB_KEY_MOUSE_WHEEL_DOWN) {
-        root = editor->active_edit_root ? editor->active_edit_root : bview_get_split_root(editor->active);
         bview = _editor_bview_at(root, ev->x, ev->y);
         if (!bview) return;
         bview_set_viewport_y(bview, bview->viewport_mark->bline->line_index + (ev->key == TB_KEY_MOUSE_WHEEL_UP ? -3 : 3), 0);
         return;
     }
 
-    root = editor->active_edit_root ? editor->active_edit_root : bview_get_split_root(editor->active);
     bview = _editor_bview_at(root, ev->x, ev->y);
 
     if (ev->key == TB_KEY_MOUSE_RELEASE) {
@@ -1723,7 +1756,7 @@ static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
         && ev->x >= bview->rect_caption.x
         && ev->x < bview->rect_caption.x + bview->rect_caption.w
     ) {
-        if (ev->key == TB_KEY_MOUSE_LEFT) editor_set_active(editor, bview);
+        if (ev->key == TB_KEY_MOUSE_LEFT) editor_set_active_preserve_viewport(editor, bview);
         return;
     }
 
@@ -1738,7 +1771,7 @@ static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
 
     if (ev->key == TB_KEY_MOUSE_MIDDLE && in_text) {
         if (bview_screen_to_bline_col(bview, ev->x, ev->y, &bview, &bline, &col) != MLE_OK) return;
-        editor_set_active(editor, bview);
+        editor_set_active_preserve_viewport(editor, bview);
         cursor = bview->active_cursor;
         mark_move_to_w_bline(cursor->mark, bline, col);
         cursor_paste_clipboard(cursor);
@@ -1746,7 +1779,7 @@ static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
     }
 
     if (ev->key == TB_KEY_MOUSE_RIGHT && (in_text || in_gutter)) {
-        editor_set_active(editor, bview);
+        editor_set_active_preserve_viewport(editor, bview);
         editor->is_mousedown = 0;
         m_btn = TB_KEY_MOUSE_RIGHT;
         m_bview = bview;
@@ -1766,7 +1799,7 @@ static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
     if (ev->key != TB_KEY_MOUSE_LEFT) return;
 
     if (bview->is_menu && _editor_line_at(bview, ev->y, &bline)) {
-        editor_set_active(editor, bview);
+        editor_set_active_preserve_viewport(editor, bview);
         if (cursor->is_anchored) cursor_lift_anchor(cursor);
         mark_move_to_w_bline(cursor->mark, bline, 0);
         m_bview = bview;
@@ -1778,7 +1811,7 @@ static void _editor_handle_mouse(editor_t *editor, tb_event_t *ev) {
 
     if (!in_text && !in_gutter) return;
 
-    editor_set_active(editor, bview);
+    editor_set_active_preserve_viewport(editor, bview);
     extend = (ev->mod & TB_MOD_SHIFT) ? 1 : 0;
     now = _editor_mono_ms();
 
@@ -2306,6 +2339,10 @@ static void _editor_register_cmds(editor_t *editor) {
     _editor_register_cmd_fn(editor, "cmd_viewport_toggle", cmd_viewport_toggle);
     _editor_register_cmd_fn(editor, "cmd_viewport_top", cmd_viewport_top);
     _editor_register_cmd_fn(editor, "cmd_wake_sleeping_cursors", cmd_wake_sleeping_cursors);
+    workspace_register_commands(editor);
+    project_tools_register_commands(editor);
+    codeintel_register_commands(editor);
+    git_extra_register_commands(editor);
     _editor_register_cmd_fn(editor, "_editor_menu_cancel", _editor_menu_cancel);
     _editor_register_cmd_fn(editor, "_editor_menu_submit", _editor_menu_submit);
     _editor_register_cmd_fn(editor, "_editor_prompt_cancel", _editor_prompt_cancel);
@@ -2328,6 +2365,7 @@ static void _editor_init_kmaps(editor_t *editor) {
     _editor_init_kmap(editor, &editor->kmap_normal, "mle_normal", "cmd_insert_data", 0, (kbinding_def_t[]){
         MLE_KBINDING_DEF("cmd_guide", "f1"),
         MLE_KBINDING_DEF("cmd_show_help", "f2"),
+        MLE_KBINDING_DEF("cmd_palette", "f11"),
         MLE_KBINDING_DEF("cmd_options", "f8"),
         MLE_KBINDING_DEF("cmd_side", "f9"),
         MLE_KBINDING_DEF_EX("cmd_side", "f10", "git"),

@@ -24,6 +24,7 @@ mle_objects:=$(patsubst $(mle_srcdir)/%.c,$(mle_objdir)/%.o,$(mle_sources))
 mle_objects_no_main:=$(filter-out $(mle_objdir)/main.o,$(mle_objects))
 mle_unit_test_sources:=$(wildcard tests/unit/test_*.c)
 mle_unit_test_objects:=$(patsubst tests/unit/%.c,$(mle_testdir)/%.o,$(mle_unit_test_sources))
+mle_depfiles:=$(mle_objects:.o=.d) $(mle_unit_test_objects:.o=.d)
 mle_unit_test_all:=$(mle_testdir)/test$(mle_exeext)
 mle_vendor_deps:=
 mle_static_var:=
@@ -60,7 +61,7 @@ $(mle_bin): $(mle_vendor_deps) $(mle_objects) $(mle_srcdir)/termbox2.h | $(mle_d
 	$(CC) $(mle_static_var) $(mle_cflags) $(mle_objects) $(mle_ldflags) $(mle_ldlibs) -o $@
 
 $(mle_objdir)/%.o: $(mle_srcdir)/%.c | $(mle_objdir)
-	$(CC) -c $(mle_cflags) $< -o $@
+	$(CC) -MMD -MP -c $(mle_cflags) $< -o $@
 
 $(mle_static_libs):
 	$(MAKE) -C vendor CC="$(CC)" AR="$(AR)"
@@ -68,7 +69,7 @@ $(mle_static_libs):
 	@test -f $(mle_vendor_libdir)/liblua5.5.a
 
 $(mle_testdir)/%.o: tests/unit/%.c | $(mle_testdir)
-	$(CC) -DTEST_NAME=$(basename $(notdir $<)) -c $(mle_cflags) $< -o $@
+	$(CC) -MMD -MP -DTEST_NAME=$(basename $(notdir $<)) -c $(mle_cflags) $< -o $@
 
 $(mle_unit_test_all): $(mle_objects_no_main) $(mle_unit_test_objects) tests/unit/test.c $(mle_vendor_deps) | $(mle_testdir)
 	$(CC) $(mle_cflags) -rdynamic tests/unit/test.c $(mle_objects_no_main) $(mle_unit_test_objects) $(mle_ldflags) $(mle_ldlibs) -ldl -o $@
@@ -83,6 +84,8 @@ unit: $(mle_unit_test_all)
 
 test: $(mle_bin) unit
 	$(mle_bin) -v && MLE=$(abspath $(mle_bin)) $(MAKE) -C tests
+
+-include $(mle_depfiles)
 
 # Named `release`, not `dist`: a target called dist fights the dist/ directory.
 release: $(mle_bin)

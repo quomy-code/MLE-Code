@@ -34,6 +34,8 @@ Per-system commands live in [docs/](docs/README.md).
 * Window splitting
 * Integrated terminal (tabs, splits, scrollback, drag to resize)
 * File list and a git panel with commit, push, pull, and a click-through diff
+* Command palette, project tasks, Problems, Outline, completion, and snippets
+* Session restore, crash recovery, file watching, folding, and replace previews
 * Six color themes, plus themes you name yourself
 * Regex search and replace
 * Large file support
@@ -179,7 +181,43 @@ lists them. Mouse selection is on by default; `-e0` turns it off. A drag
 selects each letter under the pointer, including the one you started on.
 Double-click selects a word and triple-click selects a line. Releasing a drag
 copies and leaves the selection on screen. Typing replaces it. The old `M-e`
-shell command is unchanged.
+shell command is unchanged. Every editor view has a horizontal scrollbar along
+the bottom and a vertical one on the right; click the arrows or track, or drag
+either thumb. Split views keep their own scrollbars.
+
+### Project tools and code intelligence
+
+`F11` opens the command palette. Type part of a command or feature name, then
+choose a row. Project search and replace, tasks, Problems, Outline, completion,
+snippets, folding, language-server actions, file format controls, session
+recovery, and the extra Git tools live there instead of crowding the editor.
+
+MLE Code restores the last set of named files when it starts empty. Cursor
+positions are included. Unsaved buffers are copied atomically to
+`~/.mle/state/recovery` every ten seconds. Named files changed by another
+process are reported without overwriting local edits. The status bar shows
+UTF-8/BOM and LF/CRLF; `File format` changes those values deliberately.
+
+Project configuration is an optional `.mle-project` file in the repository
+root. It is intentionally line-based:
+
+    task.build=make
+    task.test=make test
+    snippet.guard=if (${cursor}) {\n\t\n}
+    lsp.command=/usr/local/bin/mle-lsp-adapter
+
+The task runner stores its latest output for Problems; selecting a
+`file:line:column` diagnostic jumps to it. Outline uses `ctags` when installed.
+Completion and snippets need no external program. The optional language-server
+adapter receives `ACTION FILE LINE COLUMN WORD` and prints
+`file:line:column` locations, keeping protocol clients outside the small C
+core.
+
+Folding is non-destructive: the buffer and undo history retain every line.
+The gutter shows `v` for a foldable block and `>` for a collapsed one. Git
+marks use `+`, `~`, and `-`. Palette actions show changed lines, a side-by-side
+diff, stage only the hunk under the cursor, and resolve conflicts as ours,
+theirs, or both.
 
 ### Files, git, and the status bar
 
@@ -188,22 +226,36 @@ right-click, or Enter opens it. Click a folder to expand it. Double-click or
 right-click steps into it. Backspace steps up. `/` asks for a folder path, and
 `~` means your home directory. Drag the blue edge to resize the list.
 
+In the file list, `n` creates a file, `N` creates a directory, `r` renames the
+selected entry, and `x` removes a file or empty directory after you type
+`yes`. Open buffers are never discarded by a filesystem action.
+
 `f10` switches the same panel to git. The line under the branch is the
 GitHub account. If `gh` or `~/.git-credentials` already has one, mle uses
 it. `g`, `[`, `]`, Left, and Right switch accounts. `n` starts a login:
 username, then password. GitHub wants a personal access token in the
 password field. Enter saves that login. `N` forgets a login mle stored.
-The next line is the commit message. Enter or Commit commits it. Push and
-Pull sit on the row under that. Push still asks you to type `yes`. Pull
+The next line is the commit message. Enter or Commit commits it. Push, Pull,
+and Fetch sit on the row under that. Push still asks you to type `yes`. Pull
 runs and shows the result. Click a changed file to open a diff: each block
 starts with `line N` so you can see where it changed, then the added and
-removed lines. Double-click or Enter opens the file. `a` stages, `u`
-unstages, `d` shows that diff again, `l` shows the log. `x` discards one
-file only after you type `yes`. Escape leaves the field, then the list.
+removed lines. Status labels distinguish modified, staged, untracked, renamed,
+deleted, and conflicted files. `f`, or clicking the branch row, filters those
+labels; `/` searches changed paths and an empty search clears it. Double-click
+or Enter opens the file. `a` and `u` stage or unstage one
+file; `A` and `U` apply that to all files. `d` shows one diff, `D` the full
+stat, `l` the log, and `L` its graph. `b` lists branches, `B` switches branches,
+and `C` creates and switches to a branch. `t` lists tags, `T` creates one, `R`
+shows remotes, and `w` lists worktrees. On a changed file, `h` shows its history
+and `v` opens blame. `i` lists stashes, `s` creates one, `S` pops the latest
+stash after confirmation, and `F` fetches and prunes. `x`
+discards one file only after you type `yes`. Escape leaves the field, then
+the list. SSH remotes work without adding a GitHub login.
 
-`f8` `symbols` cycles four sets compiled into mle: `plain` (ASCII), `marks`
-(arrows and triangles), and two bitmap fonts, `slab` and `line`. Those fonts
-are drawn as braille, so the shape does not depend on the terminal's font.
+`f8` `symbols` cycles five sets compiled into mle: `plain` (ASCII), `marks`
+(arrows and triangles), and three bitmap fonts, `mini`, `slab`, and `line`.
+The quiet `mini` set is intended for dense panels. The bitmap fonts are drawn
+as braille, so their shapes do not depend on the terminal's font.
 
 The status bar names the file, the line and column, the language, and the git
 branch. Click the file name for the buffer list, the line for go-to-line, and
@@ -218,8 +270,10 @@ the next time mle starts. Built-in themes stay as they are; painting one
 copies it first.
 
 Syntax highlighting covers the usual source, web, data, and config languages,
-and a small fallback colors files that do not match a specific pack. Rules are
-PCRE, so opening a file stays cheap.
+including PowerShell, Terraform/HCL, GraphQL, Nix, OCaml, dotenv, and Git
+control files. JSON-with-comments and modern C++/TypeScript keywords are also
+recognized. A small fallback colors files that do not match a specific pack.
+Rules are PCRE, so opening a file stays cheap.
 
 ### Advanced usage: Headless mode
 

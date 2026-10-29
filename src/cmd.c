@@ -1327,7 +1327,7 @@ static void opt_build(editor_t *editor, str_t *menu) {
     str_append(menu, row);
     snprintf(row, sizeof(row), "  hlline      shade the line the cursor is on                       %s\n", opt_onoff(editor->hl_line));
     str_append(menu, row);
-    snprintf(row, sizeof(row), "  symbols     arrows and two built-in fonts                         %s\n", glyphs_name());
+    snprintf(row, sizeof(row), "  symbols     arrows and three built-in fonts                       %s\n", glyphs_name());
     str_append(menu, row);
     str_append(menu, "  newtheme    copy this theme under a new name\n");
     str_append(menu, "  painttheme  set one color, for example comment bold cyan\n");
@@ -1826,7 +1826,7 @@ int cmd_show_help(cmd_context_t *ctx) {
         "        Ctrl-O open, Ctrl-X quit, Ctrl-Z undo, Ctrl-Y redo,\n"
         "        Ctrl-F find, Ctrl-G next, Ctrl-K cut, Ctrl-U paste,\n"
         "        Shift-Insert paste, F1 guide, F2 this list, F7 terminal,\n"
-        "        F8 settings, F9 files, F10 git.\n"
+        "        F8 settings, F9 files, F10 git, F11 command palette.\n"
         "        Every other binding still works. This page lists them.\n"
         "        C- means Ctrl\n"
         "        M- means Alt\n"
@@ -1842,12 +1842,13 @@ int cmd_show_help(cmd_context_t *ctx) {
         "        f8 opens settings and stays open. Escape or the close row leaves.\n"
         "        Themes: mle, paper, night, forest, ember, ocean, plus your own.\n"
         "        newtheme copies one. painttheme sets a color. They save to ~/.mle/themes.\n"
-        "        f1 is a short guide. f9 is the file list. f10 is git.\n"
+        "        f1 is a short guide. f9 is files. f10 is git. f11 is project tools.\n"
         "        In git, type the commit on its line. Commit, Push, and Pull\n"
-        "        are buttons. Click a file for a diff that names each line.\n"
+        "        are buttons. f filters status labels; A/U stage/unstage all.\n"
+        "        Click a file for a diff that names each changed line.\n"
         "        Push and discard still ask you to type yes. Pull does not.\n"
-        "        f8 symbols cycles plain, marks, slab, and line. The last two\n"
-        "        are bitmap fonts compiled into mle and drawn as braille.\n"
+        "        f8 symbols cycles plain, marks, mini, slab, and line. The last\n"
+        "        three are bitmap fonts compiled into mle and drawn as braille.\n"
         "        Press / in the file list to type a folder path.\n"
         "        Drag selects letters under the pointer. Double-click selects a word.\n"
         "        Triple-click selects a line. The status bar is clickable.\n"
