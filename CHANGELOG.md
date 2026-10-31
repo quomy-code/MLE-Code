@@ -6,7 +6,9 @@
 
 - modular workspace tools behind F11: command palette, session restore, crash recovery, recent projects, external-change detection, and UTF-8/LF controls
 - project search and previewed replace, task runner, Problems navigation, ctags Outline, completion, snippets, non-destructive folds, bracket diagnostics, and optional language-server adapter
-- Git line gutter, changed-line navigation, side-by-side diff, stage-current-hunk, conflict resolver, and safe create/rename/remove actions in the file panel
+- Git line gutter, changed-line navigation, before/after comparison, stage-current-hunk, conflict resolver, and safe create/rename/remove actions in the file panel
+- git file rows show `+N -N`, and a click compares the old line with the new one
+- Ctrl-Shift-~ toggles the terminal; the editor asks the host for that chord without taking over Ctrl-C
 - integrated terminal panel with a real PTY, tabs, splits, scrollback, and copy into the editor cut buffer
 - terminal parser consumes OSC titles, bracketed paste, clear, and readline cursor editing
 - F8 settings menu stays open while you change options, with runtime key rebinding, and Ctrl-Shift-grave terminal toggle when the host sends that chord
@@ -21,6 +23,8 @@
 - six color themes (mle, paper, night, forest, ember, ocean) plus named themes saved in ~/.mle/themes
 - git panel: type a commit in the list, with Commit, Push, Pull, and Fetch buttons; clicking a file opens a diff that names each changed line
 - the cursor stays on the line being edited, and prompt and git fields accept any letters, including more than one GitHub account from gh, git, or a username and token
+- fold marks appear on the block start and stay dim; the default theme keeps cyan for the file name and uses blue for the active file
+- the terminal tab row has one accent, on the active tab, and shell text keeps its Unicode characters
 - five symbol sets compiled into mle: plain, marks, and the mini, slab, and line bitmap fonts, with icons for files, filters, conflicts, stashes, fetch, refresh, search, checks, and logs
 - Git status labels and filters, stage/unstage-all, fetch, stash, branch list, graph log, and whole-tree diff stats
 - Git path search, branch switch/create, tags, remotes, worktrees, stash list, file history, and blame

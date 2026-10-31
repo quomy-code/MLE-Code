@@ -35,6 +35,10 @@ void test(buffer_t *buf, mark_t *cur) {
     expect_dump("el", "xyz\033[1D\033[K", 8, 1, "xy");
     expect_dump("cuf", "ab\033[2D\033[CZ", 8, 1, "aZ");
     expect_dump("prompt", "\033[1;32muser\033[0m@h", 12, 1, "user@h");
+    expect_dump("utf8", "caf\xc3\xa9", 8, 1, "caf\xc3\xa9");
+    expect_dump("cyr", "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82", 8, 1, "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82");
+    expect_dump("wide", "\xe4\xbd\xa0\xe5\xa5\xbd", 8, 1, "\xe4\xbd\xa0\xe5\xa5\xbd");
+    expect_dump("utf8_after_csi", "\033[\xc3\xa9X", 8, 1, "\xc3\xa9X");
     expect_dump("readline", "clx\033[D\033[P./", 8, 1, "cl./");
 
     memset(got, 0, sizeof(got));

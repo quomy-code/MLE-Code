@@ -22,8 +22,8 @@
  *
  * A panel docks beside the edit area (bottom by default, like VS Code).
  * Each terminal is a real PTY plus a VT screen. While the panel is focused,
- * keys go to the shell. f7 / M-` toggles the panel. M-t is the command
- * prefix and is not delivered to the shell.
+ * keys go to the shell. f7, M-`, and Ctrl-Shift-~ toggle the panel.
+ * M-t is the command prefix and is not delivered to the shell.
  *
  * The outer termbox stays in its normal 16-color mode so editor colors are
  * unchanged. 256-color and truecolor sequences are mapped onto those 16.
@@ -1258,7 +1258,10 @@ static void feed_byte(iterm_t *t, unsigned char b) {
         } else if (b < 0x20) {
             exec_c0(t, b);
         } else {
+            /* A cancelled sequence must not swallow the next byte. A UTF-8
+             * lead dropped here turns the following bytes into U+FFFD. */
             t->state = ST_GROUND;
+            feed_byte(t, b);
         }
         return;
     }
@@ -2119,11 +2122,57 @@ static void draw_grip(iterm_panel_t *panel) {
     }
 }
 
+static int utf8_columns(const char *s, int max_cols, char *dst, int dst_cap) {
+    const char *p;
+    const char *end;
+    int cols = 0;
+    int nout = 0;
+    if (!dst || dst_cap < 1) return 0;
+    dst[0] = '\0';
+    if (!s || max_cols < 1) return 0;
+    end = s + strlen(s);
+    for (p = s; *p && cols < max_cols && nout < dst_cap - 1; ) {
+        uint32_t cp = 0;
+        int n = utf8_char_to_unicode(&cp, p, end);
+        int w;
+        int k;
+        if (n <= 0) break;
+        w = tb_wcwidth(cp);
+        if (w < 1) w = (cp >= 0x20 && cp != 0xfffd) ? 1 : 0;
+        if (w < 1 || cols + w > max_cols || nout + n >= dst_cap) break;
+        for (k = 0; k < n; k++) dst[nout++] = p[k];
+        p += n;
+        cols += w;
+    }
+    dst[nout] = '\0';
+    return cols;
+}
+
+static int paint_utf8(int x, int y, const char *s, uintattr_t fg, uintattr_t bg) {
+    const char *p;
+    const char *end;
+    int cols = 0;
+    if (!s) return 0;
+    end = s + strlen(s);
+    for (p = s; *p; ) {
+        uint32_t cp = 0;
+        int n = utf8_char_to_unicode(&cp, p, end);
+        int w;
+        if (n <= 0) break;
+        p += n;
+        w = tb_wcwidth(cp);
+        if (w < 1) w = 1;
+        tb_set_cell(x + cols, y, cp, fg, bg);
+        cols += w;
+    }
+    return cols;
+}
+
 static void draw_tabs(iterm_panel_t *panel) {
     iterm_t *t;
     int x0, y, tw, x, badge_w, limit, plus_reserve, px;
     char badge[32];
-    uintattr_t bar_fg, bar_bg, act_fg, act_bg, plus_fg, plus_bg, xfg, xbg;
+    uintattr_t bar_fg, bar_bg, act_fg, act_bg, plus_fg, plus_bg, xfg;
     mle_theme_t *th;
     th = theme_current(panel->editor);
     tab_box(panel, &x0, &y, &tw);
@@ -2136,16 +2185,18 @@ static void draw_tabs(iterm_panel_t *panel) {
     bar_bg = th->muted_bg;
     act_fg = th->accent_fg;
     act_bg = th->accent_bg;
+    plus_fg = th->muted_fg;
+    plus_bg = th->muted_bg;
+    xfg = th->muted_fg;
     if (!th->user && th->text_fg == 0 && th->text_bg == 0) {
         bar_fg = TB_WHITE;
         bar_bg = TB_BLACK | TB_BRIGHT;
-        act_fg = TB_BLACK | TB_BOLD;
-        act_bg = TB_CYAN;
+        act_fg = TB_CYAN | TB_BOLD;
+        act_bg = bar_bg;
+        plus_fg = TB_BLACK;
+        plus_bg = bar_bg;
+        xfg = TB_BLACK;
     }
-    plus_fg = th->accent_fg;
-    plus_bg = th->accent_bg;
-    xfg = th->err_fg;
-    xbg = th->err_bg;
     for (x = 0; x < tw; x++) tb_set_cell(x0 + x, y, ' ', bar_fg, bar_bg);
     badge[0] = '\0';
     if (tw >= 28) {
@@ -2159,19 +2210,36 @@ static void draw_tabs(iterm_panel_t *panel) {
     limit -= plus_reserve;
     x = 0;
     DL_FOREACH(panel->terms, t) {
-        char label[40];
-        int labw, k;
+        char label[64];
+        char shown[40];
+        int labw;
         uintattr_t fg, bg;
+        int active = panel->focus && panel->focus->term == t;
         const char *title = t->title[0] ? t->title : "shell";
-        snprintf(label, sizeof(label), " %d:%.12s ", t->id, title);
-        labw = (int)strlen(label);
+        utf8_columns(title, 12, shown, (int)sizeof(shown));
+        snprintf(label, sizeof(label), " %d:%s ", t->id, shown);
+        labw = 0;
+        {
+            const char *p = label;
+            const char *end = label + strlen(label);
+            while (*p) {
+                uint32_t cp = 0;
+                int n = utf8_char_to_unicode(&cp, p, end);
+                int w;
+                if (n <= 0) break;
+                w = tb_wcwidth(cp);
+                if (w < 1) w = 1;
+                labw += w;
+                p += n;
+            }
+        }
         if (x + labw + 1 > limit) break;
-        fg = (panel->focus && panel->focus->term == t) ? act_fg : bar_fg;
-        bg = (panel->focus && panel->focus->term == t) ? act_bg : bar_bg;
-        for (k = 0; k < labw; k++) tb_set_cell(x0 + x + k, y, (uint32_t)label[k], fg, bg);
+        fg = active ? act_fg : bar_fg;
+        bg = active ? act_bg : bar_bg;
+        paint_utf8(x0 + x, y, label, fg, bg);
         t->tab_x = x0 + x;
         t->tab_w = labw;
-        tb_set_cell(x0 + x + labw, y, glyphs_decor() ? glyphs_cp(GLY_CLOSE) : (uint32_t)'x', xfg, xbg);
+        tb_set_cell(x0 + x + labw, y, glyphs_decor() ? glyphs_cp(GLY_CLOSE) : (uint32_t)'x', active ? fg : xfg, bg);
         t->close_x = x0 + x + labw;
         x += labw + 1;
     }
@@ -2186,7 +2254,7 @@ static void draw_tabs(iterm_panel_t *panel) {
         }
     }
     if (badge_w > 0 && badge_w <= tw) {
-        tb_printf(x0 + tw - badge_w, y, th->bar_fg, th->bar_bg, "%s", badge);
+        tb_printf(x0 + tw - badge_w, y, plus_fg, bar_bg, "%s", badge);
     }
 }
 
@@ -3005,8 +3073,11 @@ void iterm_draw(editor_t *editor) {
 static int is_toggle_key(struct tb_event *ev) {
     if (ev->key == TB_KEY_F7 && !(ev->mod & TB_MOD_ALT)) return 1;
     if ((ev->mod & TB_MOD_ALT) && ev->ch == '`') return 1;
-    /* Ctrl+Shift+` / ~ only. Plain Ctrl+Space is the same key with no shift. */
-    if (ev->key == TB_KEY_CTRL_TILDE && (ev->mod & TB_MOD_CTRL) && (ev->mod & TB_MOD_SHIFT)) return 1;
+    /* Ctrl+Shift+` is often delivered as Ctrl plus '~', because Shift is
+       already folded into the character. Ctrl+Space stays key 0 with no char. */
+    if ((ev->mod & TB_MOD_CTRL) && (ev->ch == '~' || ev->ch == '`')) return 1;
+    if ((ev->mod & TB_MOD_CTRL) && (ev->mod & TB_MOD_SHIFT)
+        && (ev->key == TB_KEY_CTRL_TILDE || ev->ch == '`' || ev->ch == '~')) return 1;
     return 0;
 }
 
@@ -3024,10 +3095,15 @@ int iterm_handle_key(editor_t *editor, struct tb_event *ev) {
     const char *act;
     char seq[64];
     int n;
-    if (!editor || !editor->iterm || !ev) return 0;
+    if (!editor || !ev) return 0;
+    if (editor->prompt) return 0;
+    if (is_toggle_key(ev)) {
+        iterm_action(editor, "toggle");
+        return 1;
+    }
+    if (!editor->iterm) return 0;
     panel = editor->iterm;
     if (editor->active && editor->active->is_menu) return 0;
-    if (editor->prompt) return 0;
     if ((ev->key == TB_KEY_F1 || ev->key == TB_KEY_F8 || ev->key == TB_KEY_F9 || ev->key == TB_KEY_F10)
         && !(ev->mod & (TB_MOD_CTRL | TB_MOD_ALT))) {
         panel->prefix = 0;
@@ -3050,10 +3126,6 @@ int iterm_handle_key(editor_t *editor, struct tb_event *ev) {
         return 1;
     }
 
-    if (is_toggle_key(ev)) {
-        iterm_action(editor, "toggle");
-        return 1;
-    }
     if ((ev->mod & TB_MOD_ALT) && ev->ch == 'T') {
         iterm_action(editor, "new");
         return 1;

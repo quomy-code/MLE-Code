@@ -40,10 +40,10 @@ bview_t *bview_new(editor_t *editor, int type, char *opt_path, int opt_path_len,
     if (opt_path) self->path = strndup(opt_path, opt_path_len);
     self->rect_caption.fg = TB_WHITE;
     self->rect_caption.bg = TB_BLACK;
-    self->rect_lines.fg = TB_YELLOW;
-    self->rect_lines.bg = TB_BLACK;
-    self->rect_margin_left.fg = TB_RED;
-    self->rect_margin_right.fg = TB_RED;
+    self->rect_lines.fg = TB_BLACK | TB_BRIGHT;
+    self->rect_lines.bg = 0;
+    self->rect_margin_left.fg = TB_BLACK | TB_BRIGHT;
+    self->rect_margin_right.fg = TB_BLACK | TB_BRIGHT;
     self->rect_buffer.h = 10; // TODO hack to fix _bview_set_linenum_width before bview_resize
     self->tab_width = editor->tab_width;
     self->tab_to_space = editor->tab_to_space;
@@ -838,6 +838,22 @@ static void _bview_draw_prompt(bview_t *self) {
     _bview_draw_bline(self, self->buffer->first_line, 0, NULL, NULL);
 }
 
+static int _status_cols(const char *s) {
+    int cols = 0;
+    if (!s) return 0;
+    while (*s) {
+        unsigned char ch = (unsigned char)*s;
+        int adv = 1;
+        if ((ch & 0x80) == 0) adv = 1;
+        else if ((ch & 0xE0) == 0xC0) adv = s[1] ? 2 : 1;
+        else if ((ch & 0xF0) == 0xE0) adv = (s[1] && s[2]) ? 3 : 1;
+        else if ((ch & 0xF8) == 0xF0) adv = (s[1] && s[2] && s[3]) ? 4 : 1;
+        s += adv;
+        cols += 1;
+    }
+    return cols;
+}
+
 static void _bview_draw_status(bview_t *self) {
     editor_t *editor;
     bview_t *active;
@@ -901,113 +917,119 @@ static void _bview_draw_status(bview_t *self) {
     }
 
     MLBUF_BLINE_ENSURE_CHARS(mark->bline);
-    tb_printf_rect(editor->rect_status, 0, 0, classic ? TB_WHITE : th->muted_fg, classic ? TB_BLACK : th->muted_bg, "%*.*s", editor->rect_status.w, editor->rect_status.w, " ");
+    tb_printf_rect(editor->rect_status, 0, 0, classic ? TB_WHITE : th->bar_fg, classic ? TB_BLACK : th->bar_bg, "%*.*s", editor->rect_status.w, editor->rect_status.w, " ");
     editor->status_file_x = 0;
     editor->status_file_w = 0;
     editor->status_pos_x = 0;
     editor->status_pos_w = 0;
     editor->status_git_x = 0;
     editor->status_git_w = 0;
-    x = 0;
 
-    fname = active_edit->buffer->path;
-    base = fname ? strrchr(fname, '/') : NULL;
-    base = (base && base[1]) ? base + 1 : (fname ? fname : "<unsaved>");
     {
-        int room = editor->rect_status.w;
-        int keep;
-        if (room > (int)sizeof(chunk) - 1) room = (int)sizeof(chunk) - 1;
-        if (room < 1) room = 1;
-        keep = room > 4 ? room - 4 : 0;
-        n = snprintf(chunk, sizeof(chunk), " %.*s%s ", keep, base, active_edit->buffer->is_unsaved ? "*" : "");
-    }
-    if (n < 0) n = 0;
-    if (n >= (int)sizeof(chunk)) n = (int)sizeof(chunk) - 1;
-    if (n > editor->rect_status.w) n = editor->rect_status.w;
-    tb_print(x, editor->rect_status.y, th->file_fg, th->file_bg, chunk);
-    editor->status_file_x = x;
-    editor->status_file_w = n;
-    x += n;
+        char right[4][80];
+        int rfg[4], rbg[4], rw[4], nr, rwsum, rx, i;
+        nr = 0;
+        rwsum = 0;
+        git[0] = '\0';
+        side_git_label(editor, git, sizeof(git));
+        if (git[0]) {
+            snprintf(right[nr], sizeof(right[nr]), " %.74s ", git);
+            rfg[nr] = classic ? (TB_BLACK | TB_BOLD) : th->git_fg;
+            rbg[nr] = classic ? TB_GREEN : th->git_bg;
+            rw[nr] = _status_cols(right[nr]);
+            rwsum += rw[nr];
+            nr += 1;
+        }
+        snprintf(right[nr], sizeof(right[nr]), " %s ", active_edit->syntax ? active_edit->syntax->name : "text");
+        rfg[nr] = classic ? TB_BLACK : th->accent_fg;
+        rbg[nr] = classic ? TB_WHITE : th->accent_bg;
+        rw[nr] = _status_cols(right[nr]);
+        rwsum += rw[nr] + (nr ? 1 : 0);
+        nr += 1;
+        if (workspace_status(editor)[0]) {
+            snprintf(right[nr], sizeof(right[nr]), " %s ", workspace_status(editor));
+            rfg[nr] = classic ? TB_BLACK : th->muted_fg;
+            rbg[nr] = classic ? TB_WHITE : th->muted_bg;
+            rw[nr] = _status_cols(right[nr]);
+            rwsum += rw[nr] + 1;
+            nr += 1;
+        }
+        if (editor->is_recording_macro || editor->aprocs || active->is_menu) {
+            const char *flag = editor->is_recording_macro ? "REC" : (editor->aprocs ? "RUN" : "menu");
+            snprintf(right[nr], sizeof(right[nr]), " %s ", flag);
+            if (editor->is_recording_macro) {
+                rfg[nr] = th->err_fg;
+                rbg[nr] = th->err_bg;
+            } else if (editor->aprocs) {
+                rfg[nr] = classic ? (TB_BLACK | TB_BOLD) : th->pos_fg;
+                rbg[nr] = classic ? TB_YELLOW : th->pos_bg;
+            } else {
+                rfg[nr] = classic ? TB_BLACK : th->bar_fg;
+                rbg[nr] = classic ? TB_WHITE : th->bar_bg;
+            }
+            rw[nr] = _status_cols(right[nr]);
+            rwsum += rw[nr] + 1;
+            nr += 1;
+        }
 
-    n = snprintf(chunk, sizeof(chunk), " %d/%d ", bview_num, bview_count);
-    if (n > 0 && x + n < editor->rect_status.w) {
-        tb_print(x, editor->rect_status.y, classic ? (TB_BLACK | TB_BOLD) : th->accent_fg, classic ? TB_BLUE : th->accent_bg, chunk);
-        x += n;
-    }
+        fname = active_edit->buffer->path;
+        base = fname ? strrchr(fname, '/') : NULL;
+        base = (base && base[1]) ? base + 1 : (fname ? fname : "<unsaved>");
+        {
+            int room = editor->rect_status.w - rwsum - 8;
+            int keep;
+            if (room < 8) room = 8;
+            if (room > (int)sizeof(chunk) - 1) room = (int)sizeof(chunk) - 1;
+            keep = room > 4 ? room - 4 : 1;
+            n = snprintf(chunk, sizeof(chunk), " %.*s%s ", keep, base, active_edit->buffer->is_unsaved ? "*" : "");
+        }
+        if (n < 0) n = 0;
+        if (n >= (int)sizeof(chunk)) n = (int)sizeof(chunk) - 1;
+        if (n > editor->rect_status.w) n = editor->rect_status.w;
+        x = 0;
+        tb_print(x, editor->rect_status.y, th->file_fg, th->file_bg, chunk);
+        editor->status_file_x = x;
+        editor->status_file_w = _status_cols(chunk);
+        if (editor->status_file_w > n) editor->status_file_w = n;
+        x += editor->status_file_w;
 
-    n = snprintf(chunk, sizeof(chunk), " Ln %llu/%llu  Col %llu ",
-        (unsigned long long)(mark->bline->line_index + 1),
-        (unsigned long long)active_edit->buffer->line_count,
-        (unsigned long long)mark->col);
-    if (n > 0 && x + n < editor->rect_status.w) {
-        tb_print(x, editor->rect_status.y, th->pos_fg, th->pos_bg, chunk);
-        editor->status_pos_x = x;
-        editor->status_pos_w = n;
-        x += n;
-    }
-
-    if (anchor_len > 0) {
-        n = snprintf(chunk, sizeof(chunk), " Sel %lld ", (long long)anchor_len);
-        if (n > 0 && x + n < editor->rect_status.w) {
-            tb_print(x, editor->rect_status.y, th->accent_fg, th->accent_bg, chunk);
+        n = snprintf(chunk, sizeof(chunk), " %d/%d ", bview_num, bview_count);
+        if (n > 0 && x + n + rwsum < editor->rect_status.w) {
+            tb_print(x, editor->rect_status.y, classic ? TB_WHITE : th->caption_fg, classic ? TB_BLACK : th->caption_bg, chunk);
             x += n;
         }
-    }
 
-    n = snprintf(chunk, sizeof(chunk), " %s ", active_edit->syntax ? active_edit->syntax->name : "text");
-    if (n > 0 && x + n < editor->rect_status.w) {
-        tb_print(x, editor->rect_status.y, classic ? TB_BLACK : th->bar_fg, classic ? TB_WHITE : th->bar_bg, chunk);
-        x += n;
-    }
-
-    n = snprintf(chunk, sizeof(chunk), " %s ", workspace_status(editor));
-    if (workspace_status(editor)[0] && n > 0 && x + n < editor->rect_status.w) {
-        tb_print(x, editor->rect_status.y, classic ? TB_BLACK : th->muted_fg, classic ? TB_WHITE : th->muted_bg, chunk);
-        x += n;
-    }
-
-    git[0] = '\0';
-    side_git_label(editor, git, sizeof(git));
-    if (git[0]) {
-        const char *sp;
-        int cols;
-        n = snprintf(chunk, sizeof(chunk), " %s ", git);
-        cols = 0;
-        sp = chunk;
-        while (sp && *sp) {
-            unsigned char ch = (unsigned char)*sp;
-            int adv = 1;
-            if ((ch & 0x80) == 0) adv = 1;
-            else if ((ch & 0xE0) == 0xC0) adv = sp[1] ? 2 : 1;
-            else if ((ch & 0xF0) == 0xE0) adv = (sp[1] && sp[2]) ? 3 : 1;
-            else if ((ch & 0xF8) == 0xF0) adv = (sp[1] && sp[2] && sp[3]) ? 4 : 1;
-            sp += adv;
-            cols += 1;
-        }
-        if (n > 0 && cols > 0 && x + cols < editor->rect_status.w) {
-            tb_print(x, editor->rect_status.y, th->git_fg, th->git_bg, chunk);
-            editor->status_git_x = x;
-            editor->status_git_w = cols;
-            x += cols;
-        }
-    }
-
-    if (editor->is_recording_macro) {
-        n = snprintf(chunk, sizeof(chunk), " REC ");
-        if (n > 0 && x + n < editor->rect_status.w) {
-            tb_print(x, editor->rect_status.y, th->err_fg, th->err_bg, chunk);
+        n = snprintf(chunk, sizeof(chunk), " %llu:%llu ",
+            (unsigned long long)(mark->bline->line_index + 1),
+            (unsigned long long)mark->col);
+        if (n > 0 && x + n + rwsum < editor->rect_status.w) {
+            tb_print(x, editor->rect_status.y, classic ? (TB_BLACK | TB_BOLD) : th->pos_fg, classic ? TB_CYAN : th->pos_bg, chunk);
+            editor->status_pos_x = x;
+            editor->status_pos_w = n;
             x += n;
         }
-    } else if (editor->aprocs) {
-        n = snprintf(chunk, sizeof(chunk), " RUN ");
-        if (n > 0 && x + n < editor->rect_status.w) {
-            tb_print(x, editor->rect_status.y, classic ? (TB_BLACK | TB_BOLD) : th->pos_fg, classic ? TB_YELLOW : th->pos_bg, chunk);
-            x += n;
+
+        if (anchor_len > 0) {
+            n = snprintf(chunk, sizeof(chunk), " %lld ", (long long)anchor_len);
+            if (n > 0 && x + n + rwsum < editor->rect_status.w) {
+                tb_print(x, editor->rect_status.y, th->accent_fg, th->sel_bg ? th->sel_bg : th->accent_bg, chunk);
+                x += n;
+            }
         }
-    }
-    if (active->is_menu) {
-        n = snprintf(chunk, sizeof(chunk), " menu ");
-        if (n > 0 && x + n < editor->rect_status.w) tb_print(x, editor->rect_status.y, classic ? TB_BLACK : th->bar_fg, classic ? TB_WHITE : th->bar_bg, chunk);
+
+        rx = editor->rect_status.w - rwsum;
+        if (rx < x + 1) rx = x + 1;
+        for (i = nr - 1; i >= 0; i--) {
+            rx -= rw[i];
+            if (rx >= x) {
+                tb_print(rx, editor->rect_status.y, rfg[i], rbg[i], right[i]);
+                if (git[0] && i == 0) {
+                    editor->status_git_x = rx;
+                    editor->status_git_w = rw[i];
+                }
+            }
+            rx -= 1;
+        }
     }
     (void)anchor_nlines;
 
@@ -1105,7 +1127,7 @@ static void _bview_draw_edit(bview_t *self, int x, int y, int w, int h) {
             // Draw pre/post blank
             mle_theme_t *th = theme_current(self->editor);
             int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
-            int bfg = classic ? 0 : th->text_fg;
+            int bfg = classic ? (TB_BLACK | TB_BRIGHT) : th->text_fg;
             int bbg = classic ? 0 : th->text_bg;
             if (self->linenum_width > 0) tb_printf_rect(self->rect_lines, 0, rect_y, bfg, bbg, "%*c", self->linenum_width, '~');
             tb_printf_rect(self->rect_margin_left, 0, rect_y, bfg, bbg, "%c", ' ');
@@ -1200,8 +1222,8 @@ static void _bview_draw_scrollbars(bview_t *self) {
     classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
     track_fg = classic ? TB_WHITE : th->muted_fg;
     track_bg = classic ? TB_BLACK : th->muted_bg;
-    thumb_fg = classic ? (TB_WHITE | TB_BOLD) : th->accent_fg;
-    thumb_bg = classic ? TB_BLUE : th->accent_bg;
+    thumb_fg = classic ? TB_WHITE : th->muted_fg;
+    thumb_bg = classic ? (TB_BLACK | TB_BRIGHT) : th->muted_bg;
     htrack = glyphs_decor() ? 0x2500 : (uint32_t)'-';
     vtrack = glyphs_decor() ? 0x2502 : (uint32_t)'|';
     thumb = glyphs_decor() ? 0x2588 : (uint32_t)'#';
@@ -1380,11 +1402,13 @@ static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t
     if (MLE_BVIEW_IS_EDIT(self) && self->linenum_width > 0) {
         mle_theme_t *th = theme_current(self->editor);
         int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
-        int linenum_fg = is_cursor_line ? TB_BOLD : 0;
+        int linenum_fg;
         int linenum_bg = 0;
-        if (!classic) {
-            linenum_fg = th->text_fg;
-            if (is_cursor_line) linenum_fg |= TB_BOLD;
+        if (classic) {
+            linenum_fg = is_cursor_line ? TB_WHITE : (TB_BLACK | TB_BRIGHT);
+        } else {
+            linenum_fg = th->text_fg ? th->text_fg : (uint16_t)(TB_BLACK | TB_BRIGHT);
+            linenum_fg |= is_cursor_line ? TB_BOLD : TB_DIM;
             linenum_bg = th->text_bg;
             if (self->editor->hl_line && is_cursor_line && !self->is_menu) linenum_bg = th->line_bg;
         }
@@ -1403,18 +1427,32 @@ static void _bview_draw_bline(bview_t *self, bline_t *bline, int rect_y, bline_t
     if (MLE_BVIEW_IS_EDIT(self)) {
         mle_theme_t *th = theme_current(self->editor);
         int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
-        int mfg = classic ? 0 : th->muted_fg;
         int mbg = classic ? 0 : th->text_bg;
         if (!classic && self->editor->hl_line && is_cursor_line && !self->is_menu) mbg = th->line_bg;
         {
             char mark = codeintel_fold_mark(self->editor, self, bline);
             char git_mark = git_extra_line_mark(self->editor, self, bline->line_index);
-            if (git_mark != ' ') mark = git_mark;
-            if (viewport_x > 0 && bline->char_count > 0) mark = '^';
-            tb_printf_rect(self->rect_margin_left, 0, rect_y, mfg, mbg, "%c", mark);
+            int gfg = classic ? (TB_BLACK | TB_BRIGHT) : (int)(th->muted_fg | TB_DIM);
+            if (git_mark != ' ') {
+                mark = git_mark;
+                if (classic) {
+                    if (git_mark == '+') gfg = TB_GREEN;
+                    else if (git_mark == '-') gfg = TB_RED;
+                    else if (git_mark == '~') gfg = TB_YELLOW;
+                } else if (git_mark == '+') gfg = th->git_fg;
+                else if (git_mark == '-') gfg = th->err_fg;
+                else if (git_mark == '~') gfg = th->string;
+            }
+            if (viewport_x > 0 && bline->char_count > 0) {
+                mark = '^';
+                gfg = classic ? (TB_BLACK | TB_BRIGHT) : (int)(th->muted_fg | TB_DIM);
+            }
+            if (!gfg) gfg = TB_BLACK | TB_BRIGHT;
+            tb_printf_rect(self->rect_margin_left, 0, rect_y, gfg, mbg, "%c", mark);
         }
         if (!is_soft_wrapped && bline->char_vwidth - viewport_x_vcol > self->rect_buffer.w) {
-            tb_printf_rect(self->rect_margin_right, 0, rect_y, mfg, mbg, "%c", '$');
+            int ofg = classic ? (TB_BLACK | TB_BRIGHT) : (int)(th->muted_fg | TB_DIM);
+            tb_printf_rect(self->rect_margin_right, 0, rect_y, ofg ? ofg : (TB_BLACK | TB_BRIGHT), mbg, "%c", '$');
         }
     }
 

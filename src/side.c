@@ -16,6 +16,7 @@
 #define SIDE_FILES 0
 #define SIDE_GIT 1
 #define SIDE_GUIDE 2
+#define SIDE_SET 3
 #define SIDE_DEPTH 6
 #define SIDE_DIR_CAP 2000
 #define CAPTURE_MAX ((size_t)512 * 1024)
@@ -46,6 +47,8 @@ typedef struct side_row_s {
     char gitx;
     char gity;
     int conflict;
+    int added;
+    int removed;
 } side_row_t;
 
 struct side_panel_s {
@@ -114,6 +117,10 @@ static char *saved_askpass;
 
 static int utf8_next(const char **sp, uint32_t *cp);
 static const char *git_row_label(const side_row_t *row);
+static void paint(int x, int y, int w, uint16_t fg, uint16_t bg, const char *s);
+static void git_enter(editor_t *editor);
+static void git_stage_default(editor_t *editor);
+static int list_origin(const struct side_panel_s *p);
 
 static const char *guide_text =
     "mle\n"
@@ -139,7 +146,8 @@ static const char *guide_text =
     "  Click a file to select it. Double-click, Right, or Enter opens it.\n"
     "  Click a folder to expand it. Double-click or Right steps into it.\n"
     "  Backspace or Left on .. steps up. Press / and type a folder.\n"
-    "  n creates a file, N a directory, r renames, and x removes after yes.\n"
+    "  n creates a file, N a directory, r or right-click renames, and x or\n"
+    "  Delete removes the selected file after yes.\n"
     "  A path starting with ~ is your home directory. Drag the edge to resize.\n"
     "  Esc returns to the editor. F9 hides the list.\n"
     "\n"
@@ -153,8 +161,10 @@ static const char *guide_text =
     "  Enter saves that login and selects it. N forgets one mle stored.\n"
     "  Type the commit on the next line. Enter commits it.\n"
     "  Commit, Push, Pull, and Fetch are the buttons under that line.\n"
-    "  Click a file to see the diff: each block names the line, then the\n"
-    "  lines that were added or removed. Double-click or Enter opens it.\n"
+    "  Opening git stages every change, so Commit and Push are ready.\n"
+    "  Click a file to stage it, or to unstage it if it is already staged.\n"
+    "  Right-click compares it. Double-click or Enter opens it.\n"
+    "  ~ changed, + added, - removed. The list shows +N -N.\n"
     "  Status labels say modified, staged, untracked, renamed, or conflict.\n"
     "  f, or a click on the branch row, filters those labels. / searches files.\n"
     "  a/u stage or unstage one file. A/U do that for every file.\n"
@@ -162,7 +172,10 @@ static const char *guide_text =
     "  b lists branches. B switches one; C creates and switches to one.\n"
     "  t lists tags, T creates one, R shows remotes, and w shows worktrees.\n"
     "  h shows one file's history; v shows blame. i lists saved stashes.\n"
-    "  s stashes, S pops, and F fetches. r refreshes.\n"
+    "  s stashes, S pops, and F fetches. r refreshes. o opens the file.\n"
+    "  m merges a branch. M aborts a merge after yes.\n"
+    "  e amends the last commit after yes. q shows a short status.\n"
+    "  G continues a rebase. Z aborts a rebase after yes.\n"
     "  Push asks you to type yes. Pull runs and shows the result.\n"
     "  x discards one file after you type yes.\n"
     "  Esc leaves the field, then leaves the list. Arrows, Home, End,\n"
@@ -175,16 +188,17 @@ static const char *guide_text =
     "  so the shape does not depend on the terminal font.\n"
     "\n"
     "Settings   F8\n"
-    "  Choosing a row applies it and stays in the menu.\n"
-    "  Esc, or the close row, leaves.\n"
+    "  The panel draws each option as a row with a value chip.\n"
+    "  Enter or a click applies that row and stays here.\n"
+    "  Esc, or the close row, returns to the editor.\n"
     "  Themes: mle, paper, night, forest, ember, ocean.\n"
     "  newtheme copies the current theme. painttheme sets one color.\n"
     "  Saved themes live in ~/.mle/themes and come back next launch.\n"
     "\n"
-    "Terminal   F7 or Alt-grave\n"
+    "Terminal   F7, Alt-grave, or Ctrl-Shift-~\n"
     "  Drag the bar between the editor and the shell to resize it.\n"
     "  + on the tab row opens another shell. x on a tab closes that one.\n"
-    "  F7 hides the panel. Ctrl-C inside it goes to the shell.\n"
+    "  F7 or Ctrl-Shift-~ hides the panel. Ctrl-C inside it goes to the shell.\n"
     "  Alt-t still reaches the full command list.\n"
     "\n"
     "Status bar\n"
@@ -648,6 +662,114 @@ int side_debug_parse_git(const char *text, size_t len, char *out, int out_cap) {
     return used;
 }
 
+static void numstat_new_path(const char *path, int plen, char *out, int outn) {
+    const char *arrow = NULL;
+    const char *brace = NULL;
+    const char *close = NULL;
+    const char *q;
+    int i;
+    if (!out || outn < 2) return;
+    out[0] = '\0';
+    if (!path || plen < 1) return;
+    for (i = 0; i + 4 <= plen; i++) {
+        if (memcmp(path + i, " => ", 4) == 0) {
+            arrow = path + i;
+            break;
+        }
+    }
+    if (!arrow) {
+        snprintf(out, (size_t)outn, "%.*s", plen, path);
+        return;
+    }
+    for (q = path; q < arrow; q++) if (*q == '{') brace = q;
+    for (q = arrow + 4; q < path + plen; q++) {
+        if (*q == '}') {
+            close = q;
+            break;
+        }
+    }
+    if (brace && close) {
+        snprintf(out, (size_t)outn, "%.*s%.*s%.*s",
+            (int)(brace - path), path,
+            (int)(close - (arrow + 4)), arrow + 4,
+            (int)((path + plen) - (close + 1)), close + 1);
+    } else {
+        snprintf(out, (size_t)outn, "%.*s", (int)((path + plen) - (arrow + 4)), arrow + 4);
+    }
+}
+
+static void add_numstat(struct side_panel_s *p, const char *path, int plen, int add, int rem) {
+    int i;
+    if (!p || !path || plen < 1) return;
+    for (i = 0; i < p->nrows; i++) {
+        if ((int)strlen(p->rows[i].name) == plen && memcmp(p->rows[i].name, path, (size_t)plen) == 0) {
+            if (add < 0 || rem < 0) {
+                p->rows[i].added = -1;
+                p->rows[i].removed = -1;
+            } else if (p->rows[i].added >= 0 && p->rows[i].removed >= 0) {
+                p->rows[i].added += add;
+                p->rows[i].removed += rem;
+            }
+            return;
+        }
+    }
+}
+
+static void apply_numstat(struct side_panel_s *p, const char *text, size_t len) {
+    const char *s;
+    const char *end;
+    if (!p || !text) return;
+    s = text;
+    end = text + len;
+    while (s < end && *s) {
+        const char *nl = memchr(s, '\n', (size_t)(end - s));
+        const char *tab1;
+        const char *tab2;
+        char path[PATH_MAX];
+        int add;
+        int rem;
+        int plen;
+        if (!nl) nl = end;
+        tab1 = memchr(s, '\t', (size_t)(nl - s));
+        tab2 = tab1 ? memchr(tab1 + 1, '\t', (size_t)(nl - (tab1 + 1))) : NULL;
+        if (tab1 && tab2) {
+            add = s[0] == '-' ? -1 : atoi(s);
+            rem = tab1[1] == '-' ? -1 : atoi(tab1 + 1);
+            plen = (int)(nl - (tab2 + 1));
+            if (plen > 0 && tab2[plen] == '\r') plen -= 1;
+            numstat_new_path(tab2 + 1, plen, path, (int)sizeof(path));
+            add_numstat(p, path, (int)strlen(path), add, rem);
+        }
+        if (nl >= end) break;
+        s = nl + 1;
+    }
+}
+
+static void load_numstat(struct side_panel_s *p) {
+    char *root;
+    char *cmd;
+    char *out;
+    size_t outlen;
+    if (!p || !p->groot[0] || p->mode != SIDE_GIT) return;
+    root = shell_arg(p->groot);
+    if (!root) return;
+    cmd = NULL;
+    out = NULL;
+    outlen = 0;
+    if (asprintf(&cmd, "git -C %s diff --numstat 2>/dev/null", root) < 0) cmd = NULL;
+    if (cmd && capture(cmd, &out, &outlen) == 0) apply_numstat(p, out, outlen);
+    free(cmd);
+    free(out);
+    cmd = NULL;
+    out = NULL;
+    outlen = 0;
+    if (asprintf(&cmd, "git -C %s diff --cached --numstat 2>/dev/null", root) < 0) cmd = NULL;
+    if (cmd && capture(cmd, &out, &outlen) == 0) apply_numstat(p, out, outlen);
+    free(cmd);
+    free(out);
+    free(root);
+}
+
 static void refresh_git(editor_t *editor, int force) {
     struct side_panel_s *p;
     char *rootarg;
@@ -689,6 +811,7 @@ static void refresh_git(editor_t *editor, int force) {
     else clear_git_status(p);
     free(cmd);
     free(out);
+    if (p->mode == SIDE_GIT && p->git_ok) load_numstat(p);
     if (p->mode == SIDE_GIT && p->cursor >= p->nrows) p->cursor = p->nrows ? p->nrows - 1 : 0;
 }
 
@@ -728,9 +851,13 @@ static void go_parent(struct side_panel_s *p) {
     enter_dir(p, parent);
 }
 
-static void open_file(editor_t *editor, const char *path) {
-    editor_open_bview(editor, NULL, MLE_BVIEW_TYPE_EDIT, (char *)path, (int)strlen(path), 1, 0, 0, NULL, NULL);
+static void open_file_line(editor_t *editor, const char *path, bint_t line) {
+    editor_open_bview(editor, NULL, MLE_BVIEW_TYPE_EDIT, (char *)path, (int)strlen(path), 1, line, 0, NULL, NULL);
     editor_relayout(editor);
+}
+
+static void open_file(editor_t *editor, const char *path) {
+    open_file_line(editor, path, 0);
 }
 
 static void file_create(editor_t *editor, struct side_panel_s *p, int directory) {
@@ -794,9 +921,306 @@ static void show_text(editor_t *editor, const char *title, const char *text) {
     bview_zero_viewport_y(bv);
 }
 
+#define SET_MOUSE 0
+#define SET_DRAG 1
+#define SET_TABSPACE 2
+#define SET_TABWIDTH 3
+#define SET_SYNTAX 4
+#define SET_WRAP 5
+#define SET_UNDO 6
+#define SET_LINES 7
+#define SET_INDENT 8
+#define SET_BRACKETS 9
+#define SET_TRIM 10
+#define SET_COLOR 11
+#define SET_HLLINE 12
+#define SET_THEME 13
+#define SET_SYMBOLS 14
+#define SET_TERM 15
+#define SET_DOCK 16
+#define SET_NEWTHEME 17
+#define SET_PAINT 18
+#define SET_REBIND 19
+#define SET_FILES 20
+#define SET_GIT 21
+#define SET_CLOSE 22
+#define SET_N 23
+
+static const char *set_onoff(int v) {
+    return v ? "on" : "off";
+}
+
+static const char *set_lines_name(int t) {
+    if (t == MLE_LINENUM_TYPE_REL) return "relative";
+    if (t == MLE_LINENUM_TYPE_BOTH) return "both";
+    if (t == MLE_LINENUM_TYPE_NONE) return "off";
+    return "absolute";
+}
+
+static bview_t *set_target(editor_t *editor) {
+    if (editor->active_edit && !editor->active_edit->is_menu) return editor->active_edit;
+    return editor->active_edit_last;
+}
+
+static void set_sync_lines(editor_t *editor) {
+    bview_t *bv;
+    CDL_FOREACH2(editor->all_bviews, bv, all_next) {
+        if (MLE_BVIEW_IS_EDIT(bv) && !bv->split_parent) bview_sync_linenums(bv);
+    }
+}
+
+static const char *set_label(int id) {
+    switch (id) {
+        case SET_MOUSE: return "mouse";
+        case SET_DRAG: return "drag copy";
+        case SET_TABSPACE: return "tab spaces";
+        case SET_TABWIDTH: return "tab width";
+        case SET_SYNTAX: return "syntax";
+        case SET_WRAP: return "soft wrap";
+        case SET_UNDO: return "coarse undo";
+        case SET_LINES: return "line numbers";
+        case SET_INDENT: return "auto indent";
+        case SET_BRACKETS: return "brackets";
+        case SET_TRIM: return "trim paste";
+        case SET_COLOR: return "ruler";
+        case SET_HLLINE: return "cursor line";
+        case SET_THEME: return "theme";
+        case SET_SYMBOLS: return "symbols";
+        case SET_TERM: return "terminal";
+        case SET_DOCK: return "term dock";
+        case SET_NEWTHEME: return "new theme";
+        case SET_PAINT: return "paint theme";
+        case SET_REBIND: return "rebind";
+        case SET_FILES: return "files";
+        case SET_GIT: return "git";
+        case SET_CLOSE: return "close";
+        default: return "";
+    }
+}
+
+static void set_value(editor_t *editor, int id, char *buf, size_t n) {
+    bview_t *bv;
+    bv = set_target(editor);
+    buf[0] = '\0';
+    switch (id) {
+        case SET_MOUSE: snprintf(buf, n, "%s", set_onoff(editor->mouse_support)); break;
+        case SET_DRAG: snprintf(buf, n, "%s", set_onoff(editor->mouse_copy)); break;
+        case SET_TABSPACE: snprintf(buf, n, "%s", set_onoff(bv ? bv->tab_to_space : editor->tab_to_space)); break;
+        case SET_TABWIDTH: snprintf(buf, n, "%d", bv ? bv->tab_width : editor->tab_width); break;
+        case SET_SYNTAX: snprintf(buf, n, "%s", (bv && bv->buffer && bv->buffer->is_style_disabled) ? "off" : "on"); break;
+        case SET_WRAP: snprintf(buf, n, "%s", set_onoff(bv ? bv->soft_wrap : editor->soft_wrap)); break;
+        case SET_UNDO: snprintf(buf, n, "%s", set_onoff(editor->coarse_undo)); break;
+        case SET_LINES: snprintf(buf, n, "%s", set_lines_name(editor->linenum_type)); break;
+        case SET_INDENT: snprintf(buf, n, "%s", set_onoff(editor->auto_indent)); break;
+        case SET_BRACKETS: snprintf(buf, n, "%s", set_onoff(editor->highlight_bracket_pairs)); break;
+        case SET_TRIM: snprintf(buf, n, "%s", set_onoff(editor->trim_paste)); break;
+        case SET_COLOR: snprintf(buf, n, "%d", editor->color_col); break;
+        case SET_HLLINE: snprintf(buf, n, "%s", set_onoff(editor->hl_line)); break;
+        case SET_THEME: snprintf(buf, n, "%s", theme_name(editor)); break;
+        case SET_SYMBOLS: snprintf(buf, n, "%s", glyphs_name()); break;
+        case SET_TERM: snprintf(buf, n, "%s", iterm_visible(editor) ? "shown" : "hidden"); break;
+        case SET_DOCK: snprintf(buf, n, "%s", iterm_dock_name(editor)); break;
+        case SET_NEWTHEME: snprintf(buf, n, "%s", "copy"); break;
+        case SET_PAINT: snprintf(buf, n, "%s", "color"); break;
+        case SET_REBIND: snprintf(buf, n, "%s", "key"); break;
+        case SET_FILES: snprintf(buf, n, "%s", "open"); break;
+        case SET_GIT: snprintf(buf, n, "%s", "open"); break;
+        case SET_CLOSE: snprintf(buf, n, "%s", "esc"); break;
+        default: break;
+    }
+}
+
+static void set_apply(editor_t *editor, struct side_panel_s *p) {
+    bview_t *bv;
+    int id;
+    if (!p || p->cursor < 0 || p->cursor >= SET_N) return;
+    id = p->cursor;
+    bv = set_target(editor);
+    if (id == SET_MOUSE) {
+        editor->mouse_support = editor->mouse_support ? 0 : 1;
+        editor_set_input_mode(editor);
+        MLE_SET_INFO(editor, "mouse %s", set_onoff(editor->mouse_support));
+    } else if (id == SET_DRAG) {
+        editor->mouse_copy = editor->mouse_copy ? 0 : 1;
+        MLE_SET_INFO(editor, "copy on release %s", set_onoff(editor->mouse_copy));
+    } else if (id == SET_TABSPACE && bv) {
+        int on = bv->tab_to_space ? 0 : 1;
+        bv->tab_to_space = on;
+        editor->tab_to_space = on;
+        MLE_SET_INFO(editor, "tab inserts spaces %s", set_onoff(on));
+    } else if (id == SET_TABWIDTH && bv) {
+        char *val = NULL;
+        int w;
+        editor_prompt(editor, "tab width?", NULL, &val);
+        if (!val) return;
+        w = atoi(val);
+        free(val);
+        if (w < 1) w = 1;
+        if (w > 32) w = 32;
+        editor->tab_width = w;
+        bv->tab_width = w;
+        if (bv->buffer) buffer_set_tab_width(bv->buffer, w);
+        MLE_SET_INFO(editor, "tab width %d", w);
+    } else if (id == SET_SYNTAX && bv && bv->buffer) {
+        if (bv->buffer->is_style_disabled) {
+            buffer_set_styles_enabled(bv->buffer, 1);
+            bview_set_syntax(bv, NULL);
+            MLE_SET_INFO(editor, "%s", "syntax on");
+        } else {
+            buffer_set_styles_enabled(bv->buffer, 0);
+            MLE_SET_INFO(editor, "%s", "syntax off");
+        }
+    } else if (id == SET_WRAP && bv) {
+        int on = bv->soft_wrap ? 0 : 1;
+        bv->soft_wrap = on;
+        editor->soft_wrap = on;
+        MLE_SET_INFO(editor, "soft wrap %s", set_onoff(on));
+    } else if (id == SET_UNDO) {
+        editor->coarse_undo = editor->coarse_undo ? 0 : 1;
+        MLE_SET_INFO(editor, "coarse undo %s", set_onoff(editor->coarse_undo));
+    } else if (id == SET_LINES) {
+        int t = editor->linenum_type;
+        if (t == MLE_LINENUM_TYPE_ABS) t = MLE_LINENUM_TYPE_REL;
+        else if (t == MLE_LINENUM_TYPE_REL) t = MLE_LINENUM_TYPE_BOTH;
+        else if (t == MLE_LINENUM_TYPE_BOTH) t = MLE_LINENUM_TYPE_NONE;
+        else t = MLE_LINENUM_TYPE_ABS;
+        editor->linenum_type = t;
+        set_sync_lines(editor);
+        MLE_SET_INFO(editor, "line numbers %s", set_lines_name(t));
+    } else if (id == SET_INDENT) {
+        editor->auto_indent = editor->auto_indent ? 0 : 1;
+        MLE_SET_INFO(editor, "auto indent %s", set_onoff(editor->auto_indent));
+    } else if (id == SET_BRACKETS) {
+        editor->highlight_bracket_pairs = editor->highlight_bracket_pairs ? 0 : 1;
+        MLE_SET_INFO(editor, "bracket highlight %s", set_onoff(editor->highlight_bracket_pairs));
+    } else if (id == SET_TRIM) {
+        editor->trim_paste = editor->trim_paste ? 0 : 1;
+        MLE_SET_INFO(editor, "trim paste %s", set_onoff(editor->trim_paste));
+    } else if (id == SET_COLOR) {
+        char *val = NULL;
+        int col;
+        editor_prompt(editor, "ruler column? 0 hides it", NULL, &val);
+        if (!val) return;
+        col = atoi(val);
+        free(val);
+        editor->color_col = col < 1 ? -1 : col;
+        MLE_SET_INFO(editor, "ruler column %d", editor->color_col);
+    } else if (id == SET_HLLINE) {
+        editor->hl_line = editor->hl_line ? 0 : 1;
+        MLE_SET_INFO(editor, "cursor line %s", set_onoff(editor->hl_line));
+    } else if (id == SET_THEME) {
+        theme_cycle(editor);
+        MLE_SET_INFO(editor, "theme %s", theme_name(editor));
+    } else if (id == SET_SYMBOLS) {
+        glyphs_cycle();
+        MLE_SET_INFO(editor, "symbols %s", glyphs_name());
+    } else if (id == SET_TERM) {
+        iterm_action(editor, "toggle");
+        MLE_SET_INFO(editor, "terminal %s", iterm_visible(editor) ? "shown" : "hidden");
+    } else if (id == SET_DOCK) {
+        iterm_action(editor, "dockcycle");
+        MLE_SET_INFO(editor, "terminal dock %s", iterm_dock_name(editor));
+    } else if (id == SET_NEWTHEME) {
+        char *name = NULL;
+        editor_prompt(editor, "new theme name?", NULL, &name);
+        if (!name) return;
+        if (!name[0] || theme_create(editor, name) != 0) MLE_SET_ERR(editor, "%s", "theme: could not create");
+        else MLE_SET_INFO(editor, "theme %s", theme_name(editor));
+        free(name);
+    } else if (id == SET_PAINT) {
+        char *spec = NULL;
+        editor_prompt(editor, "paint: comment bold cyan", NULL, &spec);
+        if (!spec) return;
+        if (theme_paint(editor, spec) != 0) MLE_SET_ERR(editor, "%s", "theme: could not paint");
+        else MLE_SET_INFO(editor, "theme %s", theme_name(editor));
+        free(spec);
+    } else if (id == SET_REBIND) {
+        char *cmdn = NULL;
+        char *key = NULL;
+        editor_prompt(editor, "command? (cmd_save)", NULL, &cmdn);
+        if (!cmdn || !cmdn[0]) { free(cmdn); return; }
+        editor_prompt(editor, "key? (C-s, f5)", NULL, &key);
+        if (!key || !key[0]) { free(cmdn); free(key); return; }
+        if (editor_bind(editor, "mle_normal", cmdn, key, NULL) != MLE_OK) MLE_SET_ERR(editor, "rebind: no command %s", cmdn);
+        else MLE_SET_INFO(editor, "rebind: %s runs %s", key, cmdn);
+        free(cmdn);
+        free(key);
+    } else if (id == SET_FILES) {
+        p->mode = SIDE_FILES;
+        rescan_files(p);
+    } else if (id == SET_GIT) {
+        p->mode = SIDE_GIT;
+        p->git_ms = 0;
+        refresh_git(editor, 1);
+        git_stage_default(editor);
+        git_enter(editor);
+    } else if (id == SET_CLOSE) {
+        p->focused = 0;
+    }
+}
+
+static void draw_settings(editor_t *editor, struct side_panel_s *p, int body, int body_fg, int body_bg, int on_fg, int on_bg, int path_fg, int path_bg) {
+    int i;
+    mle_theme_t *th;
+    th = theme_current(editor);
+    for (i = 0; i < body; i++) {
+        int id, y, fg, bg, chip_fg, chip_bg, name_w, chip_w;
+        char val[48];
+        char line[160];
+        const char *label;
+        id = p->scroll + i;
+        y = p->y + list_origin(p) + i;
+        if (id < 0 || id >= SET_N) {
+            paint(p->x, y, p->w - 1, body_fg, body_bg, "");
+            continue;
+        }
+        label = set_label(id);
+        set_value(editor, id, val, sizeof(val));
+        chip_w = (int)strlen(val) + 2;
+        if (chip_w < 4) chip_w = 4;
+        if (chip_w > p->w - 6) chip_w = p->w - 6;
+        if (chip_w < 1) chip_w = 1;
+        name_w = p->w - 1 - chip_w;
+        if (name_w < 1) name_w = 1;
+        snprintf(line, sizeof(line), " %s", label);
+        if (id == p->cursor && p->focused) {
+            fg = on_fg;
+            bg = on_bg;
+        } else if (id == p->cursor) {
+            fg = path_fg;
+            bg = path_bg;
+        } else {
+            fg = body_fg;
+            bg = body_bg;
+        }
+        paint(p->x, y, name_w, fg, bg, line);
+        if (!strcmp(val, "on") || !strcmp(val, "shown")) {
+            chip_fg = th->git_fg;
+            chip_bg = th->git_bg;
+        } else if (!strcmp(val, "off") || !strcmp(val, "hidden")) {
+            chip_fg = th->muted_fg;
+            chip_bg = th->muted_bg;
+        } else {
+            chip_fg = th->accent_fg;
+            chip_bg = th->accent_bg;
+        }
+        if (id == p->cursor && p->focused) {
+            chip_fg = on_fg;
+            chip_bg = th->bar_bg ? th->bar_bg : on_bg;
+        }
+        snprintf(line, sizeof(line), " %s", val);
+        paint(p->x + name_w, y, chip_w, chip_fg, chip_bg, line);
+    }
+}
+
 static int list_origin(const struct side_panel_s *p) {
     if (p && p->mode == SIDE_GIT) return 5;
     return 2;
+}
+
+static int row_span(const struct side_panel_s *p) {
+    if (p && p->mode == SIDE_SET) return SET_N;
+    return p ? p->nrows : 0;
 }
 
 static void wipe_mem(void *ptr, size_t n) {
@@ -1447,6 +1871,7 @@ static int git_run(editor_t *editor, const char *fmt_tail, int show_all, int use
     if (!rootarg) return -1;
     cmd = NULL;
     if (use_auth && p->nacct > 0 && p->acct_i >= 0 && p->acct_i < p->nacct
+        && strcmp(p->accts[p->acct_i].source, "manual") == 0
         && p->accts[p->acct_i].login[0] && p->accts[p->acct_i].secret[0]) {
         userarg = shell_arg(p->accts[p->acct_i].login);
         if (!userarg || !auth_begin(p)) {
@@ -1476,21 +1901,24 @@ static int git_run(editor_t *editor, const char *fmt_tail, int show_all, int use
         MLE_SET_ERR(editor, "%s", "git: command failed to start");
         return -1;
     }
-    if (out && out[0]) {
-        if (exit_code == 0) info_line(editor, out);
-        else {
-            char msg[160];
-            snprintf(msg, sizeof(msg), "git: failed: %.140s", out);
-            info_line(editor, msg);
+    if (exit_code == 0) {
+        if (out && out[0]) info_line(editor, out);
+        else MLE_SET_INFO(editor, "%s", "git: done");
+    } else if (out && out[0]) {
+        char msg[180];
+        int i = 0;
+        while (out[i] && out[i] != '\n' && i + 1 < 140) {
+            msg[i] = out[i];
+            i += 1;
         }
-        if (show_all) {
-            show_text(editor, "git", out);
-            p->focused = 0;
-        }
-    } else if (exit_code == 0) {
-        MLE_SET_INFO(editor, "%s", "git: done");
+        msg[i] = '\0';
+        MLE_SET_ERR(editor, "git: %s", msg[0] ? msg : "command failed");
     } else {
         MLE_SET_ERR(editor, "git: command failed (%d)", exit_code);
+    }
+    if (show_all && out && out[0]) {
+        show_text(editor, "git", out);
+        p->focused = 0;
     }
     free(out);
     p->git_ms = 0;
@@ -1573,122 +2001,7 @@ static int confirm_yes(editor_t *editor, const char *prompt) {
     return ok;
 }
 
-static int buf_add(char **data, size_t *len, size_t *cap, const char *s, size_t n) {
-    size_t nc;
-    char *nd;
-    if (!s) return 0;
-    if (*len + n + 1 > *cap) {
-        nc = *cap ? *cap * 2 : 1024;
-        while (nc < *len + n + 1) nc *= 2;
-        nd = realloc(*data, nc);
-        if (!nd) return -1;
-        *data = nd;
-        *cap = nc;
-    }
-    if (n) memcpy(*data + *len, s, n);
-    *len += n;
-    (*data)[*len] = '\0';
-    return 0;
-}
 
-static int buf_adds(char **data, size_t *len, size_t *cap, const char *s) {
-    return buf_add(data, len, cap, s, s ? strlen(s) : 0);
-}
-
-static void hunk_info(const char *s, int ln, int *newln, char *func, int funcap) {
-    int i, seen, at2, k;
-    *newln = 0;
-    if (funcap > 0) func[0] = '\0';
-    for (i = 0; i < ln; i++) {
-        if (s[i] != '+') continue;
-        if (i + 1 < ln && s[i + 1] >= '0' && s[i + 1] <= '9') {
-            int j = i + 1;
-            int v = 0;
-            while (j < ln && s[j] >= '0' && s[j] <= '9') {
-                v = v * 10 + (s[j] - '0');
-                j += 1;
-            }
-            *newln = v;
-            break;
-        }
-    }
-    seen = 0;
-    at2 = -1;
-    for (i = 0; i + 1 < ln; i++) {
-        if (s[i] == '@' && s[i + 1] == '@') {
-            seen += 1;
-            if (seen == 2) {
-                at2 = i;
-                break;
-            }
-        }
-    }
-    if (at2 < 0 || funcap < 2) return;
-    i = at2 + 2;
-    if (i < ln && s[i] == ' ') i += 1;
-    k = 0;
-    while (i < ln && k + 1 < funcap) func[k++] = s[i++];
-    while (k > 0 && (func[k - 1] == ' ' || func[k - 1] == '\r')) k -= 1;
-    func[k] = '\0';
-}
-
-static void append_diff_section(char **data, size_t *len, size_t *cap, const char *title, const char *raw, char *where, size_t where_n, int *places) {
-    const char *s;
-    int kept;
-    if (!raw || !raw[0]) return;
-    if (title && title[0]) {
-        buf_adds(data, len, cap, title);
-        buf_adds(data, len, cap, "\n");
-    }
-    s = raw;
-    kept = 0;
-    while (*s && kept < 300) {
-        const char *nl;
-        int ln;
-        int is_hunk, is_meta;
-        char banner[160];
-        char mark[8];
-        nl = strchr(s, '\n');
-        ln = nl ? (int)(nl - s) : (int)strlen(s);
-        if (ln > 0 && s[ln - 1] == '\r') ln -= 1;
-        is_hunk = ln >= 2 && s[0] == '@' && s[1] == '@';
-        is_meta = (ln >= 5 && strncmp(s, "index", 5) == 0)
-            || (ln >= 3 && (strncmp(s, "---", 3) == 0 || strncmp(s, "+++", 3) == 0))
-            || (ln >= 8 && strncmp(s, "old mode", 8) == 0)
-            || (ln >= 8 && strncmp(s, "new mode", 8) == 0)
-            || (ln >= 10 && strncmp(s, "similarity", 10) == 0)
-            || (ln >= 13 && strncmp(s, "dissimilarity", 13) == 0);
-        if (is_hunk) {
-            int newln = 0;
-            char func[64];
-            hunk_info(s, ln, &newln, func, (int)sizeof(func));
-            if (places) *places += 1;
-            if (where && where_n > 4 && newln > 0) {
-                char bit[24];
-                size_t have = strlen(where);
-                snprintf(bit, sizeof(bit), "L%d ", newln);
-                if (have + strlen(bit) < where_n) memcpy(where + have, bit, strlen(bit) + 1);
-            }
-            mark[0] = '\0';
-            if (glyphs_decor()) glyphs_utf8(GLY_HUNK, mark, (int)sizeof(mark));
-            if (mark[0]) snprintf(banner, sizeof(banner), "%s line %d%s%s\n", mark, newln, func[0] ? "  " : "", func);
-            else snprintf(banner, sizeof(banner), "line %d%s%s\n", newln, func[0] ? "  " : "", func);
-            buf_adds(data, len, cap, banner);
-            if (ln > 180) ln = 180;
-            buf_add(data, len, cap, s, (size_t)ln);
-            buf_adds(data, len, cap, "\n");
-        } else if (!is_meta && ln > 0) {
-            if (ln > 180) ln = 180;
-            buf_add(data, len, cap, s, (size_t)ln);
-            buf_adds(data, len, cap, "\n");
-        }
-        if (!nl) break;
-        s = nl + 1;
-        kept += 1;
-    }
-    if (kept >= 300) buf_adds(data, len, cap, "...\n");
-    buf_adds(data, len, cap, "\n");
-}
 
 static int diff_live(editor_t *editor, bview_t *want) {
     bview_t *bv;
@@ -1721,64 +2034,102 @@ static void present_diff(editor_t *editor, const char *text) {
     if (p) p->focused = 1;
 }
 
-static void show_git_diff(editor_t *editor, side_row_t *row) {
-    struct side_panel_s *p;
+static int capture_git_diff(struct side_panel_s *p, side_row_t *row, int cached, char **out) {
     char *root;
     char *file;
-    char *cmd;
-    char *work;
-    char *staged;
-    char *text;
-    size_t wlen, slen, tlen, tcap;
-    int places;
+    char *cmd = NULL;
+    size_t len = 0;
+    *out = NULL;
+    if (!p || !row || !row->path[0]) return -1;
+    root = shell_arg(p->groot[0] ? p->groot : ".");
+    file = shell_arg(row->path);
+    if (root && file) {
+        if (!cached && row->gitx == '?' && row->gity == '?') {
+            if (asprintf(&cmd, "git -C %s diff --no-index -- /dev/null %s 2>&1", root, file) < 0) cmd = NULL;
+        } else if (asprintf(&cmd, "git -C %s diff %s-- %s 2>&1", root, cached ? "--cached " : "", file) < 0) {
+            cmd = NULL;
+        }
+    }
+    if (cmd) capture(cmd, out, &len);
+    free(cmd);
+    free(root);
+    free(file);
+    return 0;
+}
+
+static void show_git_diff(editor_t *editor, side_row_t *row) {
+    struct side_panel_s *p;
+    char *raw_work = NULL;
+    char *raw_staged = NULL;
+    char *work = NULL;
+    char *staged = NULL;
+    char *text = NULL;
+    int places = 0;
+    int first = 0;
+    int first_staged = 0;
+    int nwork;
+    int nstaged;
+    size_t nw;
+    size_t ns;
+    const char *heading;
     if (!editor || !row || !row->path[0]) return;
     p = editor->side;
     if (!p) return;
     p->where[0] = '\0';
-    root = shell_arg(p->groot[0] ? p->groot : ".");
-    file = shell_arg(row->path);
-    work = NULL;
-    staged = NULL;
-    wlen = 0;
-    slen = 0;
-    cmd = NULL;
-    if (root && file) {
-        if (row->gitx == '?' && row->gity == '?') {
-            if (asprintf(&cmd, "git -C %s diff --no-index -- /dev/null %s 2>&1", root, file) < 0) cmd = NULL;
-        } else if (asprintf(&cmd, "git -C %s diff -- %s 2>&1", root, file) < 0) {
-            cmd = NULL;
-        }
-        if (cmd) capture(cmd, &work, &wlen);
-        free(cmd);
-        cmd = NULL;
-        if (!(row->gitx == '?' && row->gity == '?')) {
-            if (asprintf(&cmd, "git -C %s diff --cached -- %s 2>&1", root, file) < 0) cmd = NULL;
-            if (cmd) capture(cmd, &staged, &slen);
-            free(cmd);
+    heading = git_row_label(row);
+    if (row->gitx == '?' && row->gity == '?') heading = "untracked";
+    else if (row->gitx != '.' && row->gity == '.') heading = "staged";
+    capture_git_diff(p, row, 0, &raw_work);
+    if (!(row->gitx == '?' && row->gity == '?')) capture_git_diff(p, row, 1, &raw_staged);
+    nwork = git_extra_format_compare(raw_work, heading, &work, &first);
+    nstaged = git_extra_format_compare(raw_staged, "staged", &staged, &first_staged);
+    if (!first) first = first_staged;
+    if (nwork > 0) places += nwork;
+    if (nstaged > 0) places += nstaged;
+    nw = work ? strlen(work) : 0;
+    ns = staged ? strlen(staged) : 0;
+    if (nw || ns) {
+        text = malloc(nw + ns + 1);
+        if (text) {
+            if (nw) memcpy(text, work, nw);
+            if (ns) memcpy(text + nw, staged, ns);
+            text[nw + ns] = '\0';
         }
     }
-    free(root);
-    free(file);
-    text = NULL;
-    tlen = 0;
-    tcap = 0;
-    places = 0;
-    buf_adds(&text, &tlen, &tcap, row->name[0] ? row->name : row->path);
-    buf_adds(&text, &tlen, &tcap, "\n");
-    buf_adds(&text, &tlen, &tcap, "added lines start with +. removed lines start with -. line N is where.\n\n");
-    append_diff_section(&text, &tlen, &tcap, "work tree", work, p->where, sizeof(p->where), &places);
-    append_diff_section(&text, &tlen, &tcap, "staged", staged, p->where, sizeof(p->where), &places);
-    if (places < 1) buf_adds(&text, &tlen, &tcap, "no changes to show\n");
-    else {
-        size_t have = strlen(p->where);
-        if (have && p->where[have - 1] == ' ') p->where[have - 1] = '\0';
-    }
+    if (first > 0) snprintf(p->where, sizeof(p->where), "line %d", first);
     present_diff(editor, text ? text : "no changes to show\n");
-    if (places > 0) MLE_SET_INFO(editor, "diff: %d %s %s", places, places == 1 ? "place" : "places", p->where);
+    if (places > 0 && first > 0) MLE_SET_INFO(editor, "diff: %d changed %s, line %d", places, places == 1 ? "line" : "lines", first);
+    else if (places > 0) MLE_SET_INFO(editor, "diff: %d changed %s", places, places == 1 ? "line" : "lines");
     else MLE_SET_INFO(editor, "%s", "diff: no changes to show");
+    free(raw_work);
+    free(raw_staged);
     free(work);
     free(staged);
     free(text);
+}
+
+static void open_git_file(editor_t *editor, side_row_t *row) {
+    struct side_panel_s *p;
+    char *raw = NULL;
+    char *formatted = NULL;
+    int line = 0;
+    if (!editor || !row || !row->path[0]) return;
+    p = editor->side;
+    if (p && row->gitx != 'D' && row->gity != 'D') {
+        capture_git_diff(p, row, 0, &raw);
+        git_extra_format_compare(raw, NULL, &formatted, &line);
+        free(raw);
+        free(formatted);
+        raw = NULL;
+        formatted = NULL;
+        if (line < 1 && !(row->gitx == '?' && row->gity == '?')) {
+            capture_git_diff(p, row, 1, &raw);
+            git_extra_format_compare(raw, NULL, &formatted, &line);
+            free(raw);
+            free(formatted);
+        }
+    }
+    open_file_line(editor, row->path, line > 0 ? (bint_t)line : 0);
 }
 
 static int commit_blank(const struct side_panel_s *p) {
@@ -1790,6 +2141,23 @@ static int commit_blank(const struct side_panel_s *p) {
     return 1;
 }
 
+static int row_fully_staged(const side_row_t *row) {
+    if (!row) return 0;
+    if (row->gitx == '?' || row->gity == '?') return 0;
+    if (row->gitx == '.' || row->gitx == ' ' || row->gitx == '\0') return 0;
+    return row->gity == '.' || row->gity == ' ' || row->gity == '\0';
+}
+
+static void git_toggle_stage(editor_t *editor, side_row_t *row) {
+    if (!row || !row->path || !row->path[0]) return;
+    if (row_fully_staged(row)) git_file_cmd(editor, row, "restore --staged");
+    else git_file_cmd(editor, row, "add");
+}
+
+static void git_stage_default(editor_t *editor) {
+    git_run(editor, "add -A", 0, 0);
+}
+
 static void git_commit_msg(editor_t *editor) {
     struct side_panel_s *p;
     char *arg;
@@ -1799,22 +2167,20 @@ static void git_commit_msg(editor_t *editor) {
     char *out;
     size_t outlen;
     int exit_code;
+    const char *msg;
     p = editor->side;
     if (!p) return;
     if (p->commit_len < 0) p->commit_len = 0;
     if (p->commit_len >= (int)sizeof(p->commit_msg)) p->commit_len = (int)sizeof(p->commit_msg) - 1;
     p->commit_msg[p->commit_len] = '\0';
-    if (commit_blank(p)) {
-        p->field = FIELD_COMMIT;
-        MLE_SET_ERR(editor, "%s", "git: type a commit message");
-        return;
-    }
     if (!p->groot[0]) find_git_root_from(p, p->cwd);
     if (!p->groot[0]) {
         MLE_SET_ERR(editor, "%s", "git: no repository here");
         return;
     }
-    arg = shell_arg(p->commit_msg);
+    if (p->staged < 1) git_run(editor, "add -A", 0, 0);
+    msg = commit_blank(p) ? "update" : p->commit_msg;
+    arg = shell_arg(msg);
     if (!arg) return;
     tail = NULL;
     if (asprintf(&tail, "commit -m %s", arg) < 0) tail = NULL;
@@ -1830,8 +2196,9 @@ static void git_commit_msg(editor_t *editor) {
     free(rootarg);
     free(tail);
     free(cmd);
-    if (out && out[0]) info_line(editor, out);
     if (exit_code == 0) {
+        if (out && out[0]) info_line(editor, out);
+        else MLE_SET_INFO(editor, "%s", "git: committed");
         p->commit_msg[0] = '\0';
         p->commit_len = 0;
         p->commit_caret = 0;
@@ -1839,7 +2206,16 @@ static void git_commit_msg(editor_t *editor) {
         p->where[0] = '\0';
     } else {
         p->field = FIELD_COMMIT;
-        if (!out || !out[0]) MLE_SET_ERR(editor, "%s", "git: commit failed");
+        if (out && out[0]) {
+            char err[160];
+            int i = 0;
+            while (out[i] && out[i] != '\n' && i + 1 < (int)sizeof(err)) {
+                err[i] = out[i];
+                i += 1;
+            }
+            err[i] = '\0';
+            MLE_SET_ERR(editor, "git: %s", err[0] ? err : "commit failed");
+        } else MLE_SET_ERR(editor, "%s", "git: commit failed");
     }
     free(out);
     p->git_ms = 0;
@@ -1847,11 +2223,14 @@ static void git_commit_msg(editor_t *editor) {
 }
 
 static void git_push(editor_t *editor) {
-    if (confirm_yes(editor, "push? type yes")) git_run(editor, "push", 1, 1);
+    struct side_panel_s *p;
+    p = editor->side;
+    if (p && p->staged < 1 && (p->unstaged > 0 || p->untracked > 0)) git_stage_default(editor);
+    git_run(editor, "push -u origin HEAD", 0, 1);
 }
 
 static void git_pull(editor_t *editor) {
-    git_run(editor, "pull --no-edit", 1, 1);
+    git_run(editor, "pull --no-edit", 0, 1);
 }
 
 static void activate_row(editor_t *editor, int dbl) {
@@ -1861,8 +2240,8 @@ static void activate_row(editor_t *editor, int dbl) {
     if (!p || p->cursor < 0 || p->cursor >= p->nrows) return;
     row = &p->rows[p->cursor];
     if (p->mode == SIDE_GIT) {
-        if (dbl && row->path[0]) open_file(editor, row->path);
-        else show_git_diff(editor, row);
+        if (dbl && row->path[0]) open_git_file(editor, row);
+        else if (row->path[0]) git_toggle_stage(editor, row);
         return;
     }
     if (strcmp(row->name, "..") == 0) {
@@ -1884,13 +2263,13 @@ static void activate_row(editor_t *editor, int dbl) {
 static void ensure_cursor(struct side_panel_s *p) {
     int body;
     if (!p) return;
-    if (p->nrows < 1) {
+    if (row_span(p) < 1) {
         p->cursor = 0;
         p->scroll = 0;
         return;
     }
     if (p->cursor < 0) p->cursor = 0;
-    if (p->cursor >= p->nrows) p->cursor = p->nrows - 1;
+    if (p->cursor >= row_span(p)) p->cursor = row_span(p) - 1;
     body = p->h - (list_origin(p));
     if (body < 1) body = 1;
     if (p->cursor < p->scroll) p->scroll = p->cursor;
@@ -1899,10 +2278,10 @@ static void ensure_cursor(struct side_panel_s *p) {
 }
 
 static void move_cursor(struct side_panel_s *p, int d) {
-    if (p->nrows < 1) return;
+    if (row_span(p) < 1) return;
     p->cursor += d;
     if (p->cursor < 0) p->cursor = 0;
-    if (p->cursor >= p->nrows) p->cursor = p->nrows - 1;
+    if (p->cursor >= row_span(p)) p->cursor = row_span(p) - 1;
     ensure_cursor(p);
 }
 
@@ -2492,7 +2871,7 @@ void side_draw(editor_t *editor) {
     ensure_cursor(p);
     p->tab_files = 0;
     p->tab_git = 7;
-    p->tab_help = 12;
+    p->tab_help = 17;
     mle_theme_t *th = theme_current(editor);
     int classic = th && !th->user && th->text_fg == 0 && th->text_bg == 0;
     uint16_t tab_fg = classic ? TB_WHITE : th->muted_fg;
@@ -2505,11 +2884,12 @@ void side_draw(editor_t *editor) {
     uint16_t body_bg = classic ? TB_BLACK : (th->text_bg ? th->text_bg : th->muted_bg);
     uint16_t dir_fg = classic ? (TB_CYAN | TB_BOLD) : th->dir_fg;
     uint16_t dir_bg = classic ? TB_BLACK : th->dir_bg;
-    uint16_t grip_fg = classic ? TB_BLACK : th->grip_fg;
-    uint16_t grip_bg = classic ? TB_BLUE : th->grip_bg;
+    uint16_t grip_fg = classic ? TB_WHITE : th->grip_fg;
+    uint16_t grip_bg = classic ? (TB_BLACK | TB_BRIGHT) : th->grip_bg;
     paint(p->x, p->y, p->w, tab_fg, tab_bg, "");
     paint(p->x + p->tab_files, p->y, 6, p->mode == SIDE_FILES ? on_fg : tab_fg, p->mode == SIDE_FILES ? on_bg : tab_bg, " Files");
     paint(p->x + p->tab_git, p->y, 4, p->mode == SIDE_GIT ? on_fg : tab_fg, p->mode == SIDE_GIT ? on_bg : tab_bg, " Git");
+    paint(p->x + 12, p->y, 4, p->mode == SIDE_SET ? on_fg : tab_fg, p->mode == SIDE_SET ? on_bg : tab_bg, " Set");
     paint(p->x + p->tab_help, p->y, 2, p->mode == SIDE_GUIDE ? on_fg : tab_fg, p->mode == SIDE_GUIDE ? on_bg : tab_bg, " ?");
     base = strrchr(p->cwd, '/');
     base = (base && base[1]) ? base + 1 : p->cwd;
@@ -2528,6 +2908,8 @@ void side_draw(editor_t *editor) {
         }
     } else if (p->mode == SIDE_GUIDE) {
         snprintf(head, sizeof(head), " %s", "guide  f1 full");
+    } else if (p->mode == SIDE_SET) {
+        snprintf(head, sizeof(head), " %s", "settings   enter applies");
     } else {
         snprintf(head, sizeof(head), " %.156s/", base);
     }
@@ -2535,7 +2917,9 @@ void side_draw(editor_t *editor) {
     if (p->mode == SIDE_GIT) draw_git_chrome(editor, p, classic, on_fg, on_bg, path_fg, path_bg, body_fg, body_bg);
     body = p->h - (list_origin(p));
     if (body < 0) body = 0;
-    if (p->mode == SIDE_GUIDE) {
+    if (p->mode == SIDE_SET) {
+        draw_settings(editor, p, body, body_fg, body_bg, on_fg, on_bg, path_fg, path_bg);
+    } else if (p->mode == SIDE_GUIDE) {
         const char *s = guide_text;
         y = 0;
         while (y < body && *s) {
@@ -2588,6 +2972,14 @@ void side_draw(editor_t *editor) {
             }
             for (k = 0; p->rows[row].name[k] && n + 1 < (int)sizeof(line); k++) line[n++] = p->rows[row].name[k];
             if (p->rows[row].is_dir && strcmp(p->rows[row].name, "..") != 0 && n + 1 < (int)sizeof(line)) line[n++] = '/';
+            if (p->mode == SIDE_GIT && n + 16 < (int)sizeof(line)) {
+                char stat[32];
+                int sk;
+                stat[0] = '\0';
+                if (p->rows[row].added < 0 || p->rows[row].removed < 0) snprintf(stat, sizeof(stat), "  binary");
+                else if (p->rows[row].added || p->rows[row].removed) snprintf(stat, sizeof(stat), "  +%d -%d", p->rows[row].added, p->rows[row].removed);
+                for (sk = 0; stat[sk] && n + 1 < (int)sizeof(line); sk++) line[n++] = stat[sk];
+            }
             line[n] = '\0';
             if (row == p->cursor && p->focused) {
                 fg = on_fg;
@@ -2653,6 +3045,8 @@ int side_action(editor_t *editor, const char *action) {
         } else {
             p->focused = 0;
         }
+    } else if (strcmp(action, "blur") == 0) {
+        p->focused = 0;
     } else if (strcmp(action, "hide") == 0) {
         p->visible = 0;
         p->focused = 0;
@@ -2673,8 +3067,16 @@ int side_action(editor_t *editor, const char *action) {
             if (editor->iterm) iterm_action(editor, "unfocus");
             p->git_ms = 0;
             refresh_git(editor, 1);
+            git_stage_default(editor);
             git_enter(editor);
         }
+    } else if (strcmp(action, "settings") == 0) {
+        p->visible = 1;
+        p->focused = 1;
+        p->mode = SIDE_SET;
+        p->cursor = 0;
+        p->scroll = 0;
+        if (editor->iterm) iterm_action(editor, "unfocus");
     } else if (strcmp(action, "guide") == 0) {
         p->visible = 1;
         p->focused = 1;
@@ -2697,6 +3099,9 @@ int side_handle_key(editor_t *editor, struct tb_event *ev) {
     if (!editor || !editor->side || !ev) return 0;
     p = editor->side;
     if (!p->visible || !p->focused || p->h < 2) return 0;
+    if ((ev->mod & TB_MOD_CTRL) && (ev->ch == '~' || ev->ch == '`')) return 0;
+    if ((ev->mod & TB_MOD_CTRL) && (ev->mod & TB_MOD_SHIFT)
+        && (ev->key == TB_KEY_CTRL_TILDE || ev->ch == '`' || ev->ch == '~')) return 0;
     if (ev->key == TB_KEY_F1 || ev->key == TB_KEY_F2 || ev->key == TB_KEY_F7 || ev->key == TB_KEY_F8) return 0;
     if (ev->key == TB_KEY_F9) {
         side_action(editor, "toggle");
@@ -2788,12 +3193,18 @@ int side_handle_key(editor_t *editor, struct tb_event *ev) {
         return 1;
     }
     if (ev->key == TB_KEY_END) {
-        p->cursor = p->nrows ? p->nrows - 1 : 0;
+        p->cursor = row_span(p) ? row_span(p) - 1 : 0;
         ensure_cursor(p);
         return 1;
     }
     if (ev->key == TB_KEY_ENTER) {
-        activate_row(editor, 1);
+        if (p->mode == SIDE_SET) set_apply(editor, p);
+        else activate_row(editor, 1);
+        return 1;
+    }
+    if (p->mode == SIDE_FILES && ev->key == TB_KEY_DELETE) {
+        row = (p->cursor >= 0 && p->cursor < p->nrows) ? &p->rows[p->cursor] : NULL;
+        file_remove(editor, p, row);
         return 1;
     }
     if (ev->key == TB_KEY_BACKSPACE || ev->key == TB_KEY_BACKSPACE2) {
@@ -2903,6 +3314,20 @@ int side_handle_key(editor_t *editor, struct tb_event *ev) {
             if (confirm_yes(editor, "pop latest stash? type yes")) git_run(editor, "stash pop", 1, 0);
         } else if (ev->ch == 'x' && row) {
             if (confirm_yes(editor, "discard changes in this file? type yes")) git_file_cmd(editor, row, "restore");
+        } else if (ev->ch == 'o' && row && row->path && row->path[0]) {
+            open_git_file(editor, row);
+        } else if (ev->ch == 'm') {
+            git_prompt_cmd(editor, "merge branch?", "merge --no-edit", 1, 0);
+        } else if (ev->ch == 'M') {
+            if (confirm_yes(editor, "abort the merge? type yes")) git_run(editor, "merge --abort", 1, 0);
+        } else if (ev->ch == 'e') {
+            if (confirm_yes(editor, "amend the last commit? type yes")) git_run(editor, "commit --amend --no-edit", 1, 0);
+        } else if (ev->ch == 'q') {
+            git_run(editor, "status -sb", 1, 0);
+        } else if (ev->ch == 'G') {
+            git_run(editor, "rebase --continue", 1, 0);
+        } else if (ev->ch == 'Z') {
+            if (confirm_yes(editor, "abort the rebase? type yes")) git_run(editor, "rebase --abort", 1, 0);
         }
         return 1;
     }
@@ -2978,10 +3403,15 @@ int side_handle_mouse(editor_t *editor, struct tb_event *ev) {
     }
     if (y == p->y) {
         if (x >= p->tab_help && x < p->tab_help + 2) p->mode = SIDE_GUIDE;
-        else if (x >= p->tab_git && x < p->tab_git + 4) {
+        else if (x >= 12 && x < 16) {
+            p->mode = SIDE_SET;
+            p->cursor = 0;
+            p->scroll = 0;
+        } else if (x >= p->tab_git && x < p->tab_git + 4) {
             p->mode = SIDE_GIT;
             p->git_ms = 0;
             refresh_git(editor, 1);
+            git_stage_default(editor);
             git_enter(editor);
         } else {
             p->mode = SIDE_FILES;
@@ -3039,6 +3469,12 @@ int side_handle_mouse(editor_t *editor, struct tb_event *ev) {
     }
     body = p->h - (list_origin(p));
     idx = p->scroll + (y - (p->y + (list_origin(p))));
+    if (p->mode == SIDE_SET) {
+        if (body < 1 || idx < 0 || idx >= SET_N || y >= p->y + (list_origin(p)) + body) return 1;
+        p->cursor = idx;
+        if (ev->key == TB_KEY_MOUSE_LEFT || ev->key == TB_KEY_MOUSE_RIGHT) set_apply(editor, p);
+        return 1;
+    }
     if (body < 1 || idx < 0 || idx >= p->nrows || y >= p->y + (list_origin(p)) + body) return 1;
     now = mono_ms();
     if (idx == p->last_row && now - p->last_ms < 400) p->clicks += 1;
@@ -3049,6 +3485,18 @@ int side_handle_mouse(editor_t *editor, struct tb_event *ev) {
     if (p->mode == SIDE_GIT) {
         if (p->field == FIELD_USER || p->field == FIELD_PASS) pass_clear(p);
         p->field = FIELD_NONE;
+    }
+    if (p->mode == SIDE_FILES && ev->key == TB_KEY_MOUSE_RIGHT) {
+        file_rename(editor, p, &p->rows[p->cursor]);
+        return 1;
+    }
+    if (p->mode == SIDE_GIT && ev->key == TB_KEY_MOUSE_RIGHT) {
+        show_git_diff(editor, &p->rows[p->cursor]);
+        return 1;
+    }
+    if (p->mode == SIDE_GIT && ev->key == TB_KEY_MOUSE_LEFT && p->clicks < 2) {
+        git_toggle_stage(editor, &p->rows[p->cursor]);
+        return 1;
     }
     if (ev->key == TB_KEY_MOUSE_RIGHT || p->clicks >= 2) activate_row(editor, 1);
     else activate_row(editor, 0);
@@ -3065,7 +3513,7 @@ int side_place_cursor(editor_t *editor) {
         tb_set_cursor(p->caretx, p->carety);
         return 1;
     }
-    if (p->mode == SIDE_GUIDE || p->nrows < 1) {
+    if (p->mode == SIDE_GUIDE || (p->mode != SIDE_SET && p->nrows < 1)) {
         tb_set_cursor(-1, -1);
         return 1;
     }

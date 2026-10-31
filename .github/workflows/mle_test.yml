@@ -2,7 +2,7 @@ name: mle_test
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
 
 jobs:

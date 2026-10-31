@@ -76,31 +76,38 @@ static int ci_find_fold(bline_t *start, bint_t *end) {
     bint_t i;
     int base_indent;
     int colon = 0;
+    /* A mark belongs on a block start: an unclosed '{' or '[', or a
+     * header that ends with ':' (Python and similar). A deeper indent
+     * alone is not enough, or nearly every line in C shows a mark. */
+    if (!start || start->data_len <= 0) return MLE_ERR;
     for (i = 0; i < start->data_len; i++) {
-        if (start->data[i] == '{' || start->data[i] == '[' || start->data[i] == '(') { braces++; seen = 1; }
-        else if ((start->data[i] == '}' || start->data[i] == ']' || start->data[i] == ')') && braces > 0) braces--;
+        unsigned char c = (unsigned char)start->data[i];
+        if (c == '{' || c == '[') { braces++; seen = 1; }
+        else if ((c == '}' || c == ']') && braces > 0) braces--;
     }
     if (seen && braces > 0) {
         for (line = start->next; line; line = line->next) {
             for (i = 0; i < line->data_len; i++) {
-                if (line->data[i] == '{' || line->data[i] == '[' || line->data[i] == '(') braces++;
-                else if (line->data[i] == '}' || line->data[i] == ']' || line->data[i] == ')') braces--;
+                unsigned char c = (unsigned char)line->data[i];
+                if (c == '{' || c == '[') braces++;
+                else if (c == '}' || c == ']') braces--;
             }
             if (braces <= 0) { *end = line->line_index; return *end > start->line_index ? MLE_OK : MLE_ERR; }
         }
     }
     for (i = start->data_len; i > 0; i--) {
-        char c = start->data[i - 1];
-        if (isspace((unsigned char)c)) continue;
+        unsigned char c = (unsigned char)start->data[i - 1];
+        if (isspace(c)) continue;
         colon = c == ':';
         break;
     }
+    if (!colon) return MLE_ERR;
     base_indent = ci_indent(start);
-    if (colon || start->next) {
+    {
         bint_t last = start->line_index;
         for (line = start->next; line; line = line->next) {
             int indent;
-            if (!line->data_len) { if (last > start->line_index) last = line->line_index; continue; }
+            if (!line->data_len) continue;
             indent = ci_indent(line);
             if (indent <= base_indent) break;
             last = line->line_index;

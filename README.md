@@ -33,7 +33,7 @@ Per-system commands live in [docs/](docs/README.md).
 * Key macros
 * Window splitting
 * Integrated terminal (tabs, splits, scrollback, drag to resize)
-* File list and a git panel with commit, push, pull, and a click-through diff
+* File list and a git panel with commit, push, pull, and a before/after comparison
 * Command palette, project tasks, Problems, Outline, completion, and snippets
 * Session restore, crash recovery, file watching, folding, and replace previews
 * Six color themes, plus themes you name yourself
@@ -151,11 +151,10 @@ is inserted into the text buffer.
 
 ### Integrated terminal
 
-`f7` or Alt-grave (the key above Tab) opens a terminal panel on the bottom of
-the window, like the panel in VS Code. Press the same keys to hide it. On a
-terminal that already reports Ctrl+Shift+grave as its own chord (kitty CSI-u,
-or xterm modifyOtherKeys), that chord toggles the panel too. Classic terminals
-cannot tell it from Ctrl+Space, so `f7` remains the reliable key. While the
+`f7`, Alt-grave (the key above Tab), or Ctrl+Shift+~ opens a terminal panel
+on the bottom of the window, like the panel in VS Code. Press the same keys
+to hide it. mle asks the host for modifyOtherKeys level 1, so Ctrl+Shift+~
+is distinct from Ctrl+Space, and Ctrl+C stays a single byte. While the
 panel is focused, keys go to the shell, including `Ctrl-C` and the arrow keys.
 Drag the bar between the editor and the shell to resize the panel. It keeps
 following the pointer after you leave the panel. `+` on the tab row opens
@@ -215,8 +214,9 @@ core.
 
 Folding is non-destructive: the buffer and undo history retain every line.
 The gutter shows `v` for a foldable block and `>` for a collapsed one. Git
-marks use `+`, `~`, and `-`. Palette actions show changed lines, a side-by-side
-diff, stage only the hunk under the cursor, and resolve conflicts as ours,
+marks use `+`, `~`, and `-` on the lines that actually changed. Palette
+actions show those lines, a before/after comparison, stage only the hunk
+under the cursor, and resolve conflicts as ours,
 theirs, or both.
 
 ### Files, git, and the status bar
@@ -224,7 +224,7 @@ theirs, or both.
 `f9` shows a file list on the left. Click a file to select it. Double-click,
 right-click, or Enter opens it. Click a folder to expand it. Double-click or
 right-click steps into it. Backspace steps up. `/` asks for a folder path, and
-`~` means your home directory. Drag the blue edge to resize the list.
+`~` means your home directory. Drag the edge of the list to resize it.
 
 In the file list, `n` creates a file, `N` creates a directory, `r` renames the
 selected entry, and `x` removes a file or empty directory after you type
@@ -237,9 +237,11 @@ username, then password. GitHub wants a personal access token in the
 password field. Enter saves that login. `N` forgets a login mle stored.
 The next line is the commit message. Enter or Commit commits it. Push, Pull,
 and Fetch sit on the row under that. Push still asks you to type `yes`. Pull
-runs and shows the result. Click a changed file to open a diff: each block
-starts with `line N` so you can see where it changed, then the added and
-removed lines. Status labels distinguish modified, staged, untracked, renamed,
+runs and shows the result. Click a changed file to compare it. Each block
+names the line. The left column is what the line was, the right column is
+what it is now. `~` marks a changed line, `+` an added one, and `-` a removed
+one. The file row also shows `+N -N`. Double-click or Enter opens the file
+at the first change. Status labels distinguish modified, staged, untracked, renamed,
 deleted, and conflicted files. `f`, or clicking the branch row, filters those
 labels; `/` searches changed paths and an empty search clears it. Double-click
 or Enter opens the file. `a` and `u` stage or unstage one

@@ -29,9 +29,9 @@ Input text as normal, use directional keys to move around, use
 .Pp
 Press `F2` for full help.
 .Ss Integrated terminal
-Press `F7` or Alt-grave to toggle a terminal panel docked along the bottom
-of the window. Ctrl-Shift-grave does the same when the host terminal sends
-that chord as its own sequence. Drag the bar between the editor and the
+Press `F7`, Alt-grave, or Ctrl-Shift-~ to toggle a terminal panel docked
+along the bottom of the window. mle requests modifyOtherKeys level 1, so
+Ctrl-Shift-~ is distinct from Ctrl-Space and Ctrl-C stays a single byte. Drag the bar between the editor and the
 shell to resize the panel. `+` on the tab row opens another shell and `x`
 on a tab closes that shell. While the panel is focused, keys are sent
 to the shell, so Ctrl-C still interrupts the command.
@@ -55,7 +55,9 @@ GitHub account. If gh or git already has one, mle uses it. `g`, `[`, `]`,
 Left, and Right switch accounts. `n` starts a login. Type a username, then
 a password or a GitHub personal access token. `N` forgets a login stored
 by mle. The next line is the commit message. Commit, Push, Pull, and Fetch are
-buttons. Click a file to see what changed and which line. Status labels replace
+buttons. Click a file to compare before and after, line by line. The row
+shows how many lines were added and removed. Double-click opens the file at
+the first change. Status labels replace
 raw git codes; `f`, or a click on the branch row, filters them, and `/` searches
 changed paths. `a` and `u`
 stage or unstage one file, while `A` and `U` apply to all files. `d` shows one

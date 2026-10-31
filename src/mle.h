@@ -537,6 +537,7 @@ void git_extra_shutdown(editor_t *editor);
 int git_extra_register_commands(editor_t *editor);
 char git_extra_line_mark(editor_t *editor, bview_t *bview, bint_t line);
 int git_extra_debug_marks(const char *diff, char *marks, bint_t marks_len);
+int git_extra_format_compare(const char *diff, const char *heading, char **out, int *first_line);
 
 /* Symbol packs compiled into the binary. plain is ASCII and marks is Unicode.
    mini, slab, and line are 8x8 bitmap fonts drawn as braille. */

@@ -222,9 +222,12 @@ void syntax_extra_init(editor_t *editor) {
     add(editor, "syn_diff", "\\.(diff|patch)$", (srule_def_t[]){
         S("^(\\+\\+\\+|---).*$", FG_CMT),
         S("^@@.*$", FG_PRE),
+        S("^~.*$", TB_YELLOW | TB_BOLD),
         S("^\\+.*$", FG_KW),
         S("^-.*$", FG_PUN),
         S("^diff .*$", TB_WHITE | TB_BOLD),
+        S("^(work tree|staged|untracked|modified|added|deleted|renamed|conflict).*$", TB_WHITE | TB_BOLD),
+        S("^[0-9]+ added,.*$", FG_PRE),
         SYN_END
     });
     add(editor, "syn_ini", "\\.(ini|conf|cfg|properties)$", (srule_def_t[]){

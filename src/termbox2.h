@@ -3078,6 +3078,9 @@ static int send_init_escape_codes(void) {
         bytebuf_puts(&global.out, global.caps[TB_CAP_ENTER_KEYPAD]));
     if_err_return(rv,
         bytebuf_puts(&global.out, global.caps[TB_CAP_HIDE_CURSOR]));
+    /* modifyOtherKeys=1: ask for Ctrl+Shift+` / ~, and leave Ctrl+C as 0x03.
+       Level 1 only encodes chords that have no legacy byte. */
+    if_err_return(rv, bytebuf_puts(&global.out, "\033[>4;1m"));
     return TB_OK;
 }
 
@@ -3181,6 +3184,7 @@ static int tb_deinit(void) {
         bytebuf_puts(&global.out, global.caps[TB_CAP_CLEAR_SCREEN]);
         bytebuf_puts(&global.out, global.caps[TB_CAP_EXIT_CA]);
         bytebuf_puts(&global.out, global.caps[TB_CAP_EXIT_KEYPAD]);
+        bytebuf_puts(&global.out, "\033[>4;0m");
         bytebuf_puts(&global.out, TB_HARDCAP_EXIT_MOUSE);
         bytebuf_flush(&global.out, global.wfd);
     }
@@ -4288,9 +4292,19 @@ static int tb_iswprint_ex(uint32_t ch, int *w) {
         } else if (ch > wcwidth_table[i].range_end) {
             lo = i + 1;
         } else {
-            if (w) *w = wcwidth_table[i].width;
-            return wcwidth_table[i].width >= 0 ? 1 : 0;
+            int width = wcwidth_table[i].width;
+            /* Emoji presentation is two columns on a modern host. The old
+             * table marks this block as one column, which shifts the line. */
+            if (width == 1 && ch >= 0x1F300 && ch <= 0x1FAFF) width = 2;
+            if (w) *w = width;
+            return width >= 0 ? 1 : 0;
         }
+    }
+    /* A scalar the table does not list is still a character. Replacing it
+     * with U+FFFD is what the host shows as a broken glyph. */
+    if (ch >= 0x20 && ch <= 0x10FFFF && !(ch >= 0xD800 && ch <= 0xDFFF)) {
+        if (w) *w = (ch >= 0x1F300 && ch <= 0x1FAFF) ? 2 : 1;
+        return 1;
     }
     if (w) *w = -1; // invalid codepoint
     return 0;
